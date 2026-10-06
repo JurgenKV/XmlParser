@@ -359,6 +359,15 @@ class App(tk.Tk):
         if count % 10000 == 0:
             self._set_status(f"Обработано узлов: {count:,}", "blue")
 
+    def _show_error(self, title, message):
+        """Показ ошибки в UI-потоке (без захвата переменной исключения)."""
+        self.status.config(text=title, foreground="red")
+        messagebox.showerror(title, message)
+
+    def _show_success(self, message):
+        self.status.config(text="Готово", foreground="green")
+        messagebox.showinfo("Успех", message)
+
     def convert(self):
         xml_file = self.xml_path.get().strip()
         if not xml_file or not os.path.isfile(xml_file):
@@ -406,19 +415,16 @@ class App(tk.Tk):
                     raise ValueError(f"Неизвестный формат: {fmt}")
 
                 msg = "Готово:\n" + "\n".join(result)
-                self._set_status(f"Готово ({len(result)} файл(ов))", "green")
-                self.after(0, lambda: messagebox.showinfo("Успех", msg))
+                self.after(0, self._show_success, msg)
 
-            except ET.ParseError as e:
-                self._set_status("Ошибка XML", "red")
-                self.after(0, lambda: messagebox.showerror(
-                    "Ошибка XML", f"Не удалось разобрать XML:\n{e}"
-                ))
-            except Exception as e:
-                self._set_status("Ошибка", "red")
-                self.after(0, lambda: messagebox.showerror(
-                    "Ошибка", f"{type(e).__name__}: {e}"
-                ))
+            except ET.ParseError as exc:
+                err_text = f"Не удалось разобрать XML:\n{exc}"
+                self.after(0, self._show_error, "Ошибка XML", err_text)
+
+            except Exception as exc:
+                err_text = f"{type(exc).__name__}: {exc}"
+                self.after(0, self._show_error, "Ошибка", err_text)
+
             finally:
                 self.after(0, self._reset_ui)
 
