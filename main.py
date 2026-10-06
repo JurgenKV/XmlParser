@@ -29,57 +29,44 @@ from reportlab.pdfbase.ttfonts import TTFont
 
 QUIK_NS = "urn:quik:trans-info:v1.0"
 
-# Дополнительные русские подписи для тех полей,
-# которые QUIK может не описать в Description.
+# Русские подписи для служебных колонок
 QUIK_FIELD_LABELS = {
-    "TransId":          "ID транзакции",
-    "TradeNum":         "Номер сделки",
-    "OrderNum":         "Номер заявки",
-    "FirmCode":         "Код фирмы",
-    "FirmName":         "Наименование фирмы",
-    "ClientCode":       "Код клиента",
-    "Account":          "Счёт",
-    "Login":            "Логин",
-    "Date":             "Дата",
-    "Time":             "Время",
-    "TradeDate":        "Дата сделки",
-    "SettleDate":       "Дата расчётов",
-    "SecCode":          "Код бумаги",
-    "SecName":          "Наименование бумаги",
-    "ClassCode":        "Код класса",
-    "Exchange":         "Биржа",
-    "Operation":        "Операция",
-    "ExecType":         "Тип исполнения",
-    "Status":           "Статус",
-    "SettleCode":       "Код расчётов",
-    "Currency":         "Валюта",
-    "Quantity":         "Количество",
-    "Price":            "Цена",
-    "Volume":           "Объём",
-    "Value":            "Стоимость",
-    "AccruedInterest":  "НКД",
-    "BrokerRef":        "Примечание",
-    "Comment":          "Комментарий",
-    "Partner":          "Контрагент",
-    "Inout":            "Ввод/вывод",
-    "Reason":           "Основание",
-    "RejectReason":     "Причина отказа",
+    "@TransNum":    "№ транзакции",
+    "@UID":         "UID",
+    "@TransID":     "ID транзакции",
+    "@SessionID":   "ID сессии",
+    "@TradeDate":   "Дата сделки",
+    "@Status":      "Статус",
+    "@QuikDate":    "Дата QUIK",
+    "@QuikTime":    "Время QUIK",
+    "@ReplyTime":   "Время ответа",
+    "@OrderNum":    "№ заявки",
+    "@ClientCode":  "Код клиента",
+    "Data":         "Данные",
+    "Reply":        "Ответ",
+    "PureData":     "PureData",
+    "UserInfo.Name1":   "Имя 1",
+    "UserInfo.Name2":   "Имя 2",
+    "UserInfo.Name3":   "Имя 3",
+    "UserInfo.OrgCode": "Код организации",
+    "UserInfo.OrgName": "Организация",
+    "UserInfo.Login":   "Логин",
 }
 
+# Порядок отображения полей в таблице
 QUIK_PREFERRED_ORDER = [
-    "TransId", "TradeNum", "OrderNum",
-    "Date", "Time", "TradeDate", "SettleDate",
-    "SecCode", "SecName", "ClassCode", "Exchange",
-    "Operation", "ExecType", "Status",
-    "Quantity", "Price", "Volume", "Value",
-    "Currency", "AccruedInterest",
-    "FirmCode", "FirmName", "ClientCode", "Account",
-    "BrokerRef", "Comment",
+    "@TransNum", "@TransID", "@UID", "@SessionID",
+    "@TradeDate", "@QuikDate", "@QuikTime", "@Status",
+    "@OrderNum", "@ClientCode", "@ReplyTime",
+    "UserInfo.OrgName", "UserInfo.OrgCode", "UserInfo.Name3", "UserInfo.Login",
+    "SECCODE", "BUYSELL", "MKTLIMIT",
+    "PRICE", "QUANTITY", "ORDERVALUE",
+    "ACCOUNT", "BROKERREF", "SECBOARD",
+    "Data", "Reply",
 ]
 
 QUIK_NUMERIC_FIELDS = {
-    "Quantity", "Price", "Volume", "Value",
-    "AccruedInterest", "PosValue",
+    "PRICE", "QUANTITY", "ORDERVALUE", "VALUE", "VOLUME",
 }
 
 
@@ -102,6 +89,7 @@ def qname(local_name, namespace):
 
 
 def base_field_name(col):
+    """'@TransID' -> 'TransID'; 'UserInfo.OrgName' -> 'OrgName'."""
     if col.startswith("@"):
         return col[1:]
     if "." in col:
@@ -112,17 +100,34 @@ def base_field_name(col):
     return col
 
 
+def label_for(field_name, descriptions=None):
+    if field_name in QUIK_FIELD_LABELS:
+        return QUIK_FIELD_LABELS[field_name]
+    base = base_field_name(field_name)
+    if base in QUIK_FIELD_LABELS:
+        return QUIK_FIELD_LABELS[base]
+    if descriptions and field_name in descriptions:
+        return descriptions[field_name]
+    if descriptions and base in descriptions:
+        return descriptions[base]
+    return field_name
+
+
 def format_quik_value(col, value):
     base = base_field_name(col)
     if value is None:
         return ""
     s = str(value).strip()
 
+    # YYYY-MM-DD -> DD.MM.YYYY
+    if len(s) == 10 and s[4] == "-" and s[7] == "-":
+        y, m, d = s.split("-")
+        if y.isdigit() and m.isdigit() and d.isdigit():
+            return f"{d}.{m}.{y}"
+
+    # YYYYMMDD -> DD.MM.YYYY
     if base in ("Date", "TradeDate", "SettleDate") and len(s) == 8 and s.isdigit():
         return f"{s[6:8]}.{s[4:6]}.{s[0:4]}"
-
-    if base == "Time" and len(s) == 6 and s.isdigit():
-        return f"{s[0:2]}:{s[2:4]}:{s[4:6]}"
 
     if base in QUIK_NUMERIC_FIELDS:
         try:
@@ -144,29 +149,6 @@ def detect_namespace(path):
                 return tag.split("}", 1)[0][1:]
             return None
     return None
-
-
-def _path_under(root, node):
-    parts = []
-    cur = node
-    guard = 0
-    while cur is not None and cur is not root:
-        parts.append(strip_ns(cur.tag))
-        cur = cur.getparent()
-        guard += 1
-        if guard > 1000:
-            break
-    return ".".join(reversed(parts)) or strip_ns(node.tag)
-
-
-def _add_field(rec, key, value):
-    if key not in rec:
-        rec[key] = value
-        return
-    i = 2
-    while f"{key}_{i}" in rec:
-        i += 1
-    rec[f"{key}_{i}"] = value
 
 
 # ============================================================
@@ -193,7 +175,6 @@ def analyze_structure(path, sample_limit=200000):
             else:
                 if stack:
                     stack.pop()
-
                 if tag is not None and stack:
                     parent = stack[-1]
                     ptag = parent.tag if isinstance(parent.tag, str) else None
@@ -241,42 +222,43 @@ def detect_record_tag(stats, preferred="Trans"):
 
 
 # ============================================================
-# 3. ИЗВЛЕЧЕНИЕ ЗАПИСЕЙ С РАЗВОРОТОМ TransData/Field
+# 3. ИЗВЛЕЧЕНИЕ ЗАПИСЕЙ
 # ============================================================
 
 class ExtractConfig:
-    """Параметры распаковки QUIK-структуры."""
     def __init__(self,
                  container_tag="TransData",
                  field_tag="Field",
-                 name_tag="Name",
-                 description_tag="Description",
-                 value_tag="Value"):
+                 name_attr="Name",
+                 description_attr="Description",
+                 value_attr="Value",
+                 prepared_attr="PreparedValue"):
         self.container_tag = container_tag
         self.field_tag = field_tag
-        self.name_tag = name_tag
-        self.description_tag = description_tag
-        self.value_tag = value_tag
+        self.name_attr = name_attr
+        self.description_attr = description_attr
+        self.value_attr = value_attr
+        self.prepared_attr = prepared_attr
 
 
 def extract_records(path, record_tag, namespace=None,
                     config=None, descriptions=None,
                     progress_cb=None, cancel_flag=None, max_records=None):
     """
-    Потоково извлекает записи.
+    Извлекает записи из QUIK XML.
 
-    Логика:
-      1) Атрибуты самой записи -> "@attr".
-      2) Прямой текст -> "_text".
-      3) Обычные вложенные поля -> "path.to.field".
-      4) Внутри контейнера config.container_tag (по умолчанию TransData):
-         находим узлы config.field_tag (по умолчанию Field),
-         у каждого берём Name / Description / Value,
-         в запись кладём {Name: Value},
-         а описания из Description запоминаем в словаре descriptions,
-         чтобы использовать их как заголовки колонок.
-
-    Параметр descriptions — общий dict (Name -> Description).
+    Правила:
+      1. Атрибуты самой <Trans> -> "@attr" (напр. "@TransID").
+      2. Дочерние узлы, у которых всё в атрибутах (напр. <UserInfo>)
+         -> "Тег.@атрибут" (напр. "UserInfo.OrgName").
+      3. Дочерние узлы с текстом (напр. <Data>, <Reply>)
+         -> ключ = имя тега, значение = текст.
+      4. Внутри <TransData> находим <Field>:
+         - Name, Description, Value, PreparedValue — атрибуты,
+         - ключ колонки = Name,
+         - значение = PreparedValue (если пусто — Value),
+         - Description запоминается в descriptions для заголовка колонки.
+      5. Сам TransData и Field в плоский обход НЕ попадают.
     """
     if config is None:
         config = ExtractConfig()
@@ -299,72 +281,56 @@ def extract_records(path, record_tag, namespace=None,
             for k, v in elem.attrib.items():
                 rec[f"@{strip_ns(k)}"] = v
 
-            # 2. прямой текст
-            direct_text = (elem.text or "").strip()
-            if direct_text:
-                rec["_text"] = direct_text
+            # 2. TransData -> Field (атрибуты)
+            handled = set()
 
-            # 3. найдём все контейнеры (TransData) и соберём их Field-ы
             containers = elem.findall(f".//{config.container_tag}")
-            # если namespace задан, попробуем и с ним
             if namespace and not containers:
                 containers = elem.findall(
                     f".//{{{namespace}}}{config.container_tag}")
 
-            handled_field_elements = set()
-
             for container in containers:
-                # Field-ы внутри контейнера
+                handled.add(id(container))
+
                 fields = container.findall(config.field_tag)
                 if namespace and not fields:
                     fields = container.findall(
                         f"{{{namespace}}}{config.field_tag}")
 
                 for field in fields:
-                    name_el = field.find(config.name_tag)
-                    if name_el is None and namespace:
-                        name_el = field.find(f"{{{namespace}}}{config.name_tag}")
+                    handled.add(id(field))
 
-                    value_el = field.find(config.value_tag)
-                    if value_el is None and namespace:
-                        value_el = field.find(f"{{{namespace}}}{config.value_tag}")
-
-                    desc_el = field.find(config.description_tag)
-                    if desc_el is None and namespace:
-                        desc_el = field.find(
-                            f"{{{namespace}}}{config.description_tag}")
-
-                    name = (name_el.text or "").strip() if name_el is not None else ""
-                    value = (value_el.text or "").strip() if value_el is not None else ""
-                    desc = (desc_el.text or "").strip() if desc_el is not None else ""
-
-                    # запоминаем описание (один раз)
-                    if name and desc and name not in descriptions:
-                        descriptions[name] = desc
+                    name = (field.get(config.name_attr) or "").strip()
+                    desc = (field.get(config.description_attr) or "").strip()
+                    value = (field.get(config.value_attr) or "").strip()
+                    prepared = (field.get(config.prepared_attr) or "").strip()
 
                     if not name:
                         continue
 
-                    # если поля с таким именем ещё нет — пишем значение
-                    # если уже есть — суффикс _2, _3, ...
-                    _add_field(rec, name, value)
+                    display_value = prepared if prepared else value
 
-                    # помечаем, что этот Field уже обработан,
-                    # чтобы не задваивать его в общем обходе
-                    handled_field_elements.add(id(field))
-                    # и сам контейнер тоже помечаем
-                    handled_field_elements.add(id(container))
+                    if desc and name not in descriptions:
+                        descriptions[name] = desc
 
-            # 4. обход остальных потомков (кроме Field в TransData)
+                    if name in rec:
+                        i = 2
+                        while f"{name}_{i}" in rec:
+                            i += 1
+                        rec[f"{name}_{i}"] = display_value
+                    else:
+                        rec[name] = display_value
+
+            # 3. остальные потомки (кроме содержимого TransData)
             for child in elem.iter():
                 if child is elem:
                     continue
                 if not isinstance(child.tag, str):
                     continue
-                if id(child) in handled_field_elements:
+                if id(child) in handled:
                     continue
 
-                # пропускаем всё, что внутри TransData — уже разобрано
+                # пропускаем всё, что внутри TransData
                 in_container = False
                 cur = child
                 while cur is not None and cur is not elem:
@@ -375,18 +341,30 @@ def extract_records(path, record_tag, namespace=None,
                 if in_container:
                     continue
 
-                path_to_child = _path_under(elem, child)
+                tag_local = strip_ns(child.tag)
 
+                # текст узла
                 text = (child.text or "").strip()
                 if text:
-                    _add_field(rec, path_to_child, text)
+                    key = tag_local
+                    if key in rec:
+                        i = 2
+                        while f"{key}_{i}" in rec:
+                            i += 1
+                        rec[f"{key}_{i}"] = text
+                    else:
+                        rec[key] = text
 
+                # атрибуты узла -> "Тег.@атрибут"
                 for ak, av in child.attrib.items():
-                    _add_field(rec, f"{path_to_child}.@{strip_ns(ak)}", av)
-
-                tail = (child.tail or "").strip()
-                if tail:
-                    _add_field(rec, f"{path_to_child}._tail", tail)
+                    key = f"{tag_local}.@{strip_ns(ak)}"
+                    if key in rec:
+                        i = 2
+                        while f"{key}_{i}" in rec:
+                            i += 1
+                        rec[f"{key}_{i}"] = av
+                    else:
+                        rec[key] = av
 
             yield rec
 
@@ -403,7 +381,6 @@ def extract_records(path, record_tag, namespace=None,
 
 def dump_first_record(xml_path, record_tag="Trans", namespace=None,
                       max_depth=10):
-    """Текстовый дамп первой записи — для диагностики структуры."""
     search_tag = qname(record_tag, namespace)
 
     with open(xml_path, "rb") as f:
@@ -419,8 +396,6 @@ def dump_first_record(xml_path, record_tag="Trans", namespace=None,
                 attrs = " ".join(f'{strip_ns(k)}="{v}"'
                                  for k, v in node.attrib.items())
                 text = (node.text or "").strip()
-                tail = (node.tail or "").strip()
-
                 head = f"{pad}<{t}"
                 if attrs:
                     head += " " + attrs
@@ -434,9 +409,6 @@ def dump_first_record(xml_path, record_tag="Trans", namespace=None,
                         continue
                     walk(c, depth + 1)
 
-                if tail:
-                    lines.append(f"{pad}  # tail: {tail!r}")
-
             walk(elem)
             return "\n".join(lines)
     return "(записей не найдено)"
@@ -445,19 +417,6 @@ def dump_first_record(xml_path, record_tag="Trans", namespace=None,
 # ============================================================
 # 4. КОЛОНКИ
 # ============================================================
-
-def label_for(field_name, descriptions=None):
-    if field_name in QUIK_FIELD_LABELS:
-        return QUIK_FIELD_LABELS[field_name]
-    base = base_field_name(field_name)
-    if base in QUIK_FIELD_LABELS:
-        return QUIK_FIELD_LABELS[base]
-    if descriptions and base in descriptions:
-        return descriptions[base]
-    if descriptions and field_name in descriptions:
-        return descriptions[field_name]
-    return field_name
-
 
 def build_columns(records, descriptions=None):
     seen = {}
@@ -475,7 +434,10 @@ def build_columns(records, descriptions=None):
         for k in all_keys:
             if k in used:
                 continue
-            if base_field_name(k) == pref:
+            if k == pref:
+                preferred.append(k)
+                used.add(k)
+            elif base_field_name(k) == base_field_name(pref):
                 preferred.append(k)
                 used.add(k)
 
@@ -754,7 +716,7 @@ class DumpWindow(tk.Toplevel):
     def __init__(self, master, text):
         super().__init__(master)
         self.title("Сырой дамп первой записи")
-        self.geometry("820x600")
+        self.geometry("900x600")
 
         frame = ttk.Frame(self)
         frame.pack(fill="both", expand=True, padx=8, pady=8)
@@ -776,7 +738,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("QUIK XML → отчёт (DOCX / PDF / HTML)")
-        self.geometry("780x720")
+        self.geometry("820x760")
         self.resizable(False, False)
 
         self.xml_path = tk.StringVar()
@@ -785,12 +747,12 @@ class App(tk.Tk):
         self.limit = tk.IntVar(value=100000)
         self.view_mode = tk.StringVar(value="table")
 
-        # параметры распаковки TransData/Field
         self.container_tag = tk.StringVar(value="TransData")
         self.field_tag = tk.StringVar(value="Field")
-        self.name_tag = tk.StringVar(value="Name")
-        self.desc_tag = tk.StringVar(value="Description")
-        self.value_tag = tk.StringVar(value="Value")
+        self.name_attr = tk.StringVar(value="Name")
+        self.desc_attr = tk.StringVar(value="Description")
+        self.value_attr = tk.StringVar(value="Value")
+        self.prepared_attr = tk.StringVar(value="PreparedValue")
 
         self.cancel_flag = threading.Event()
         self.detected_tags = []
@@ -800,13 +762,15 @@ class App(tk.Tk):
     def _build_ui(self):
         pad = {"padx": 10, "pady": 6}
 
+        # 1. Файл
         frame_file = ttk.LabelFrame(self, text="1. XML-файл QUIK")
         frame_file.pack(fill="x", **pad)
-        ttk.Entry(frame_file, textvariable=self.xml_path, width=65).pack(
+        ttk.Entry(frame_file, textvariable=self.xml_path, width=70).pack(
             side="left", padx=6, pady=6, fill="x", expand=True)
         ttk.Button(frame_file, text="Обзор…", command=self.choose_file).pack(
             side="right", padx=6, pady=6)
 
+        # 2. Диагностика
         frame_an = ttk.LabelFrame(self, text="2. Диагностика")
         frame_an.pack(fill="x", **pad)
         ttk.Button(frame_an, text="Анализ структуры",
@@ -815,6 +779,7 @@ class App(tk.Tk):
         ttk.Button(frame_an, text="Сырой дамп первой записи",
                    command=self.show_dump).pack(side="left", padx=6, pady=6)
 
+        # 3. Тег записи
         frame_rec = ttk.LabelFrame(
             self, text="3. Тег записи (по умолчанию Trans)")
         frame_rec.pack(fill="x", **pad)
@@ -825,32 +790,40 @@ class App(tk.Tk):
         ttk.Entry(frame_rec, textvariable=self.limit, width=10).pack(
             side="left", padx=6)
 
-        # --- параметры распаковки Field ---
+        # 4. Параметры Field (атрибуты)
         frame_fields = ttk.LabelFrame(
-            self, text="4. Параметры TransData / Field")
+            self, text="4. Параметры TransData / Field (атрибуты)")
         frame_fields.pack(fill="x", **pad)
 
-        row1 = ttk.Frame(frame_fields)
-        row1.pack(fill="x", padx=6, pady=4)
-        ttk.Label(row1, text="Контейнер:").pack(side="left")
-        ttk.Entry(row1, textvariable=self.container_tag, width=14).pack(
+        r1 = ttk.Frame(frame_fields)
+        r1.pack(fill="x", padx=6, pady=4)
+        ttk.Label(r1, text="Контейнер:").pack(side="left")
+        ttk.Entry(r1, textvariable=self.container_tag, width=14).pack(
             side="left", padx=4)
-        ttk.Label(row1, text="Тег поля:").pack(side="left", padx=(12, 0))
-        ttk.Entry(row1, textvariable=self.field_tag, width=10).pack(
-            side="left", padx=4)
-
-        row2 = ttk.Frame(frame_fields)
-        row2.pack(fill="x", padx=6, pady=4)
-        ttk.Label(row2, text="Тег имени:").pack(side="left")
-        ttk.Entry(row2, textvariable=self.name_tag, width=12).pack(
-            side="left", padx=4)
-        ttk.Label(row2, text="Тег описания:").pack(side="left", padx=(12, 0))
-        ttk.Entry(row2, textvariable=self.desc_tag, width=14).pack(
-            side="left", padx=4)
-        ttk.Label(row2, text="Тег значения:").pack(side="left", padx=(12, 0))
-        ttk.Entry(row2, textvariable=self.value_tag, width=10).pack(
+        ttk.Label(r1, text="Тег поля:").pack(side="left", padx=(12, 0))
+        ttk.Entry(r1, textvariable=self.field_tag, width=10).pack(
             side="left", padx=4)
 
+        r2 = ttk.Frame(frame_fields)
+        r2.pack(fill="x", padx=6, pady=4)
+        ttk.Label(r2, text="Атрибут имени:").pack(side="left")
+        ttk.Entry(r2, textvariable=self.name_attr, width=12).pack(
+            side="left", padx=4)
+        ttk.Label(r2, text="Атрибут описания:").pack(side="left", padx=(12, 0))
+        ttk.Entry(r2, textvariable=self.desc_attr, width=14).pack(
+            side="left", padx=4)
+
+        r3 = ttk.Frame(frame_fields)
+        r3.pack(fill="x", padx=6, pady=4)
+        ttk.Label(r3, text="Атрибут значения:").pack(side="left")
+        ttk.Entry(r3, textvariable=self.value_attr, width=12).pack(
+            side="left", padx=4)
+        ttk.Label(r3, text="Атрибут PreparedValue:").pack(
+            side="left", padx=(12, 0))
+        ttk.Entry(r3, textvariable=self.prepared_attr, width=16).pack(
+            side="left", padx=4)
+
+        # 5. Представление
         frame_view = ttk.LabelFrame(self, text="5. Представление")
         frame_view.pack(fill="x", **pad)
         ttk.Radiobutton(frame_view, text="Таблица",
@@ -860,6 +833,7 @@ class App(tk.Tk):
                         value="cards", variable=self.view_mode).pack(
             side="left", padx=12, pady=6)
 
+        # 6. Формат
         frame_fmt = ttk.LabelFrame(self, text="6. Формат вывода")
         frame_fmt.pack(fill="x", **pad)
         for fmt, label in [("html", "HTML"), ("docx", "Word (.docx)"),
@@ -868,11 +842,13 @@ class App(tk.Tk):
                             variable=self.format_var).pack(
                 side="left", padx=12, pady=6)
 
+        # Прогресс
         frame_prog = ttk.LabelFrame(self, text="Прогресс")
         frame_prog.pack(fill="x", **pad)
         self.progress = ttk.Progressbar(frame_prog, mode="indeterminate")
         self.progress.pack(fill="x", padx=6, pady=8)
 
+        # Кнопки
         frame_btn = ttk.Frame(self)
         frame_btn.pack(fill="x", **pad)
         self.btn_convert = ttk.Button(frame_btn, text="Сформировать отчёт",
@@ -908,9 +884,10 @@ class App(tk.Tk):
         return ExtractConfig(
             container_tag=self.container_tag.get().strip() or "TransData",
             field_tag=self.field_tag.get().strip() or "Field",
-            name_tag=self.name_tag.get().strip() or "Name",
-            description_tag=self.desc_tag.get().strip() or "Description",
-            value_tag=self.value_tag.get().strip() or "Value",
+            name_attr=self.name_attr.get().strip() or "Name",
+            description_attr=self.desc_attr.get().strip() or "Description",
+            value_attr=self.value_attr.get().strip() or "Value",
+            prepared_attr=self.prepared_attr.get().strip() or "PreparedValue",
         )
 
     def run_analysis(self):
