@@ -17,25 +17,22 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import cm
 from reportlab.lib import colors
 from reportlab.platypus import (
-    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak,
+    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle,
 )
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
-from reportlab.lib.enums import TA_LEFT
 
 
 # ============================================================
-# 1. АНАЛИЗ СТРУКТУРЫ XML — определяем "записи"
+# 1. АНАЛИЗ СТРУКТУРЫ XML
 # ============================================================
 
 def analyze_structure(path, sample_limit=200000):
     """
-    Проходит по XML потоково и собирает статистику:
+    Потоково собирает статистику по тегам:
       - сколько раз встречается каждый тег,
-      - сколько у него детей-элементов (в среднем),
-      - какие теги-дети наиболее часты.
-
-    Возвращает dict: tag -> {"count": N, "children": Counter(child_tag)}
+      - какие теги-дети у него бывают (Counter).
+    Безопасно обрабатывает комментарии и processing instructions.
     """
     stats = defaultdict(lambda: {"count": 0, "children": Counter()})
 
@@ -46,19 +43,21 @@ def analyze_structure(path, sample_limit=200000):
     processed = 0
 
     for event, elem in context:
-        if not isinstance(elem.tag, str):
-            continue
+        tag = elem.tag if isinstance(elem.tag, str) else None
 
         if event == "start":
             stack.append(elem)
-            stats[elem.tag]["count"] += 1
-        else:
-            # записываем, какие дети были у родителя
-            if len(stack) >= 2:
-                parent = stack[-2]
-                if isinstance(parent.tag, str):
-                    stats[parent.tag]["children"][elem.tag] += 1
-            stack.pop()
+            if tag is not None:
+                stats[tag]["count"] += 1
+        else:  # end
+            if stack:
+                stack.pop()
+
+            if tag is not None and stack:
+                parent = stack[-1]
+                ptag = parent.tag if isinstance(parent.tag, str) else None
+                if ptag is not None:
+                    stats[ptag]["children"][tag] += 1
 
             # освобождаем память
             elem.clear()
@@ -75,11 +74,8 @@ def analyze_structure(path, sample_limit=200000):
 
 def detect_record_tag(stats):
     """
-    Эвристика: "запись" — это тег, который:
-      - встречается много раз,
-      - у него есть дети-элементы (обычно >= 2),
-      - у него один и тот же родитель.
-    Возвращает (tag, score) победителя или None.
+    Эвристика: 'запись' — тег, который встречается много раз
+    и имеет стабильный набор детей.
     """
     best = None
     best_score = 0
@@ -90,12 +86,11 @@ def detect_record_tag(stats):
         if cnt < 2 or n_children < 1:
             continue
 
-        # средняя "наполненность" детей
         total_child_uses = sum(info["children"].values())
-        # хотим: много повторов + стабильная структура детей
         score = cnt * min(n_children, 5) + total_child_uses
 
-        # предпочитаем теги, у которых дети разные (не один и тот же тег)
+        # если у всех записей ровно один и тот же дочерний тег —
+        # это, скорее всего, не запись, а обёртка
         if len(info["children"]) == 1:
             score *= 0.6
 
@@ -107,16 +102,29 @@ def detect_record_tag(stats):
 
 
 # ============================================================
-# 2. ИЗВЛЕЧЕНИЕ ЗАПИСЕЙ — из XML в плоские dict-ы
+# 2. ИЗВЛЕЧЕНИЕ ЗАПИСЕЙ
 # ============================================================
+
+def _path_under(root, node):
+    """Путь тега node относительно root (без самого root)."""
+    parts = []
+    cur = node
+    guard = 0
+    while cur is not None and cur is not root:
+        parts.append(cur.tag if isinstance(cur.tag, str) else "?")
+        cur = cur.getparent()
+        guard += 1
+        if guard > 1000:  # защита от бесконечного цикла
+            break
+    return ".".join(reversed(parts)) or (
+        node.tag if isinstance(node.tag, str) else "?")
+
 
 def extract_records(path, record_tag, progress_cb=None, cancel_flag=None,
                     max_records=None):
     """
     Потоково извлекает записи по тегу record_tag.
     Возвращает генератор dict: {"field": value, "@attr": value, ...}.
-
-    Идём по iterparse с событиями end и tag=record_tag — это быстро.
     """
     context = ET.iterparse(path, events=("end",), tag=record_tag)
 
@@ -131,7 +139,7 @@ def extract_records(path, record_tag, progress_cb=None, cancel_flag=None,
         for k, v in elem.attrib.items():
             rec[f"@{k}"] = v
 
-        # вложенные поля: путь через точку на случай <a><b>text</b></a>
+        # вложенные поля: ключ — путь тега от записи
         for child in elem.iter():
             if child is elem:
                 continue
@@ -139,9 +147,7 @@ def extract_records(path, record_tag, progress_cb=None, cancel_flag=None,
                 continue
             text = (child.text or "").strip()
             if text:
-                # ключ — путь от record_tag до этого тега
                 key = _path_under(elem, child)
-                # если ключ уже есть — добавим суффикс
                 if key in rec:
                     i = 2
                     while f"{key}_{i}" in rec:
@@ -149,7 +155,7 @@ def extract_records(path, record_tag, progress_cb=None, cancel_flag=None,
                     key = f"{key}_{i}"
                 rec[key] = text
 
-        # если у самого элемента был прямой текст — сохраняем
+        # прямой текст внутри самой записи
         direct_text = (elem.text or "").strip()
         if direct_text:
             rec["_text"] = direct_text
@@ -168,35 +174,24 @@ def extract_records(path, record_tag, progress_cb=None, cancel_flag=None,
             return
 
 
-def _path_under(root, node):
-    """Возвращает путь тега node относительно root (без самого root)."""
-    parts = []
-    cur = node
-    while cur is not None and cur is not root:
-        parts.append(cur.tag if isinstance(cur.tag, str) else "?")
-        cur = cur.getparent()
-    return ".".join(reversed(parts)) or (node.tag if isinstance(node.tag, str) else "?")
-
-
-def collect_all_records(path, record_tag, progress_cb=None, cancel_flag=None):
-    """Собирает все записи в список (для небольших объёмов)."""
-    return list(extract_records(path, record_tag, progress_cb, cancel_flag))
-
-
 # ============================================================
-# 3. DOCX ЭКСПОРТ — таблица + карточки
+# 3. DOCX ЭКСПОРТ
 # ============================================================
 
-def _add_table(doc, records, columns, title):
+def _add_table_docx(doc, records, columns, title):
     doc.add_heading(title, level=1)
 
     table = doc.add_table(rows=1, cols=len(columns))
-    table.style = "Light Grid Accent 1"
+    try:
+        table.style = "Light Grid Accent 1"
+    except KeyError:
+        # если стиля нет в шаблоне — оставим дефолтный
+        pass
     table.alignment = WD_TABLE_ALIGNMENT.CENTER
 
     hdr = table.rows[0].cells
     for i, col in enumerate(columns):
-        hdr[i].text = col
+        hdr[i].text = str(col)
         for p in hdr[i].paragraphs:
             for r in p.runs:
                 r.bold = True
@@ -209,7 +204,7 @@ def _add_table(doc, records, columns, title):
     return table
 
 
-def _add_cards(doc, records, columns, title):
+def _add_cards_docx(doc, records, columns, title):
     doc.add_heading(title, level=1)
     for i, rec in enumerate(records, 1):
         p = doc.add_paragraph()
@@ -230,8 +225,7 @@ def _add_cards(doc, records, columns, title):
 
 
 def export_docx(xml_path, out_path, record_tag,
-                columns=None, limit=100000,
-                progress_cb=None, cancel_flag=None,
+                limit=100000, progress_cb=None, cancel_flag=None,
                 as_cards=False):
     doc = Document()
 
@@ -240,40 +234,36 @@ def export_docx(xml_path, out_path, record_tag,
 
     meta = doc.add_paragraph()
     meta.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    meta.add_run(f"Источник: {os.path.basename(xml_path)}\n").italic = True
-    meta.add_run(f"Записей: {limit if limit else 'все'}\n").italic = True
+    r = meta.add_run(f"Источник: {os.path.basename(xml_path)}")
+    r.italic = True
 
-    # Первая выборка для определения колонок
-    records = []
-    for i, rec in enumerate(extract_records(xml_path, record_tag,
-                                            progress_cb, cancel_flag,
-                                            max_records=limit)):
-        records.append(rec)
+    records = list(extract_records(xml_path, record_tag,
+                                   progress_cb, cancel_flag,
+                                   max_records=limit))
 
     if not records:
         doc.add_paragraph("Записи не найдены.")
         doc.save(out_path)
         return
 
-    if not columns:
-        # объединённый набор ключей в порядке первого появления
-        seen = {}
-        for rec in records:
-            for k in rec:
-                if k not in seen:
-                    seen[k] = True
-        columns = list(seen.keys())
+    # колонки — по порядку первого появления
+    seen = {}
+    for rec in records:
+        for k in rec:
+            if k not in seen:
+                seen[k] = True
+    columns = list(seen.keys())
 
     if as_cards:
-        _add_cards(doc, records, columns, "Записи")
+        _add_cards_docx(doc, records, columns, "Записи")
     else:
-        _add_table(doc, records, columns, "Таблица записей")
+        _add_table_docx(doc, records, columns, "Таблица записей")
 
     doc.save(out_path)
 
 
 # ============================================================
-# 4. HTML ЭКСПОРТ — таблица + карточки
+# 4. HTML ЭКСПОРТ
 # ============================================================
 
 HTML_HEAD = """<!DOCTYPE html>
@@ -303,20 +293,19 @@ def _esc(s):
     return html.escape(str(s))
 
 
-def export_html(xml_path, out_path, record_tag, columns=None,
+def export_html(xml_path, out_path, record_tag,
                 limit=100000, progress_cb=None, cancel_flag=None,
                 as_cards=False):
     records = list(extract_records(xml_path, record_tag,
                                    progress_cb, cancel_flag,
                                    max_records=limit))
 
-    if not columns and records:
-        seen = {}
-        for rec in records:
-            for k in rec:
-                if k not in seen:
-                    seen[k] = True
-        columns = list(seen.keys())
+    seen = {}
+    for rec in records:
+        for k in rec:
+            if k not in seen:
+                seen[k] = True
+    columns = list(seen.keys())
 
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(HTML_HEAD.format(
@@ -349,7 +338,7 @@ def export_html(xml_path, out_path, record_tag, columns=None,
 
 
 # ============================================================
-# 5. PDF ЭКСПОРТ — таблица через platypus
+# 5. PDF ЭКСПОРТ
 # ============================================================
 
 def register_cyrillic_font():
@@ -368,7 +357,7 @@ def register_cyrillic_font():
     return "Helvetica"
 
 
-def export_pdf(xml_path, out_path, record_tag, columns=None,
+def export_pdf(xml_path, out_path, record_tag,
                limit=100000, progress_cb=None, cancel_flag=None,
                as_cards=False):
     font = register_cyrillic_font()
@@ -385,15 +374,13 @@ def export_pdf(xml_path, out_path, record_tag, columns=None,
                                    progress_cb, cancel_flag,
                                    max_records=limit))
 
-    if not columns and records:
-        seen = {}
-        for rec in records:
-            for k in rec:
-                if k not in seen:
-                    seen[k] = True
-        columns = list(seen.keys())
+    seen = {}
+    for rec in records:
+        for k in rec:
+            if k not in seen:
+                seen[k] = True
+    columns = list(seen.keys())
 
-    # Для широких таблиц — альбомная ориентация
     use_landscape = len(columns) > 5
     pagesize = landscape(A4) if use_landscape else A4
 
@@ -425,7 +412,6 @@ def export_pdf(xml_path, out_path, record_tag, columns=None,
                 Paragraph(_esc(rec.get(c, "")), normal) for c in columns
             ])
 
-        # распределяем ширину равномерно
         avail = (pagesize[0] - 3 * cm) / max(len(columns), 1)
         col_widths = [avail] * len(columns)
 
@@ -452,17 +438,18 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("XML → отчёт (DOCX / PDF / HTML)")
-        self.geometry("700x560")
+        self.geometry("720x580")
         self.resizable(False, False)
 
         self.xml_path = tk.StringVar()
         self.format_var = tk.StringVar(value="html")
-        self.record_tag = tk.StringVar(value="")  # пусто = авто
+        self.record_tag = tk.StringVar(value="")
         self.limit = tk.IntVar(value=100000)
-        self.view_mode = tk.StringVar(value="table")  # table | cards
-        self.detected_tags = []  # список для подсказки
+        self.view_mode = tk.StringVar(value="table")
 
         self.cancel_flag = threading.Event()
+        self.detected_tags = []
+
         self._build_ui()
 
     def _build_ui(self):
@@ -479,8 +466,8 @@ class App(tk.Tk):
                    command=self.run_analysis).pack(side="right", padx=6, pady=6)
 
         # --- запись ---
-        frame_rec = ttk.LabelFrame(self,
-            text="2. Тег записи (пусто = автоопределение)")
+        frame_rec = ttk.LabelFrame(
+            self, text="2. Тег записи (пусто = автоопределение)")
         frame_rec.pack(fill="x", **pad)
         self.cmb_tag = ttk.Combobox(frame_rec, textvariable=self.record_tag,
                                     values=[], width=40)
@@ -546,8 +533,6 @@ class App(tk.Tk):
         if count % 5000 == 0:
             self._set_status(f"Обработано записей: {count:,}", "blue")
 
-    # ---------- анализ ----------
-
     def run_analysis(self):
         xml_file = self.xml_path.get().strip()
         if not xml_file or not os.path.isfile(xml_file):
@@ -563,7 +548,6 @@ class App(tk.Tk):
                 stats = analyze_structure(xml_file, sample_limit=200000)
                 guessed = detect_record_tag(stats)
 
-                # Топ-10 кандидатов — для выпадающего списка
                 candidates = sorted(
                     ((tag, info["count"], len(info["children"]))
                      for tag, info in stats.items()
@@ -589,8 +573,6 @@ class App(tk.Tk):
                 self.after(0, self._reset_ui)
 
         threading.Thread(target=worker, daemon=True).start()
-
-    # ---------- генерация ----------
 
     def convert(self):
         xml_file = self.xml_path.get().strip()
@@ -623,7 +605,6 @@ class App(tk.Tk):
             try:
                 tag = record_tag
                 if not tag:
-                    # автоопределение
                     self._set_status("Определение тега записи…", "blue")
                     stats = analyze_structure(xml_file, sample_limit=200000)
                     tag = detect_record_tag(stats)
@@ -638,17 +619,20 @@ class App(tk.Tk):
 
                 if fmt == "html":
                     export_html(xml_file, out_path, tag,
-                                limit=limit, progress_cb=self._progress_cb,
+                                limit=limit,
+                                progress_cb=self._progress_cb,
                                 cancel_flag=self.cancel_flag,
                                 as_cards=as_cards)
                 elif fmt == "docx":
                     export_docx(xml_file, out_path, tag,
-                                limit=limit, progress_cb=self._progress_cb,
+                                limit=limit,
+                                progress_cb=self._progress_cb,
                                 cancel_flag=self.cancel_flag,
                                 as_cards=as_cards)
                 elif fmt == "pdf":
                     export_pdf(xml_file, out_path, tag,
-                               limit=limit, progress_cb=self._progress_cb,
+                               limit=limit,
+                               progress_cb=self._progress_cb,
                                cancel_flag=self.cancel_flag,
                                as_cards=as_cards)
                 else:
@@ -663,8 +647,6 @@ class App(tk.Tk):
                 self.after(0, self._reset_ui)
 
         threading.Thread(target=worker, daemon=True).start()
-
-    # ---------- ui-хелперы ----------
 
     def _show_error(self, title, message):
         self.status.config(text=title, foreground="red")
