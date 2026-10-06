@@ -30,9 +30,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 
 QUIK_NS = "urn:quik:trans-info:v1.0"
 
-# Точные ключи (совпадают с тем, что реально кладётся в rec)
 QUIK_FIELD_LABELS = {
-    # Атрибуты Trans
     "@TransNum":   "№ транзакции",
     "@UID":        "UID",
     "@TransID":    "ID транзакции",
@@ -45,12 +43,10 @@ QUIK_FIELD_LABELS = {
     "@OrderNum":   "№ заявки",
     "@ClientCode": "Код клиента",
 
-    # Текстовые потомки Trans
     "Data":     "Данные",
     "Reply":    "Ответ",
     "PureData": "PureData",
 
-    # Атрибуты UserInfo
     "UserInfo.@Name1":   "Имя 1",
     "UserInfo.@Name2":   "Имя 2",
     "UserInfo.@Name3":   "Имя 3",
@@ -59,10 +55,9 @@ QUIK_FIELD_LABELS = {
     "UserInfo.@Login":   "Логин",
 }
 
-# Числовые поля QUIK (для отображения чисел, даже если PreparedValue вдруг пустое)
 QUIK_NUMERIC_FIELDS = {
     "PRICE", "QUANTITY", "ORDERVALUE", "VALUE", "VOLUME",
-    "ACCruedInterest", "AccruedInterest",
+    "AccruedInterest",
 }
 
 
@@ -85,7 +80,6 @@ def qname(local_name, namespace):
 
 
 def base_field_name(col):
-    """'@TransID' -> 'TransID'; 'UserInfo.@Login' -> 'Login'."""
     if col.startswith("@"):
         return col[1:]
     if "." in col:
@@ -97,89 +91,52 @@ def base_field_name(col):
 
 
 def label_for(field_name, descriptions=None):
-    # 1) точный ключ
     if field_name in QUIK_FIELD_LABELS:
         return QUIK_FIELD_LABELS[field_name]
-
-    # 2) базовое имя
     base = base_field_name(field_name)
     if base in QUIK_FIELD_LABELS:
         return QUIK_FIELD_LABELS[base]
-
-    # 3) Description из TransData/Field
     if descriptions:
         if field_name in descriptions:
             return descriptions[field_name]
         if base in descriptions:
             return descriptions[base]
-
-    # 4) fallback — вернуть как есть
     return field_name
 
 
-def format_date_string(s):
-    """YYYY-MM-DD или YYYYMMDD -> DD.MM.YYYY"""
-    if not s:
-        return s
-    if len(s) == 10 and s[4] == "-" and s[7] == "-":
-        y, m, d = s.split("-")
-        if y.isdigit() and m.isdigit() and d.isdigit():
-            return f"{d}.{m}.{y}"
-    if len(s) == 8 and s.isdigit():
-        return f"{s[6:8]}.{s[4:6]}.{s[0:4]}"
-    return s
-
-
-def format_number(value, scale=None):
-    """Форматирует число с учётом Scale (кол-во знаков после запятой)."""
-    if value is None or value == "":
-        return ""
-    s = str(value).strip().replace(",", ".")
-    # если scale > 0 — QUIK хранит как целое, делим на 10^scale
-    if scale and scale > 0:
-        try:
-            num = float(s) / (10 ** scale)
-            return f"{num:.{scale}f}".rstrip("0").rstrip(".")
-        except ValueError:
-            pass
-    # обычное число
-    try:
-        num = float(s)
-        if num == int(num):
-            return str(int(num))
-        return f"{num:g}"
-    except ValueError:
-        return s
-
-
-def format_quik_value(col, value, numeric_types=None):
-    """
-    Форматирует значение.
-    col — ключ колонки,
-    value — уже подготовленное к отображению (обычно PreparedValue),
-    numeric_types — не используется (оставлено для совместимости).
-    """
+def format_quik_value(col, value):
+    """Форматирование PreparedValue для вывода."""
     base = base_field_name(col)
     if value is None:
         return ""
     s = str(value).strip()
+    if not s:
+        return ""
 
-    # даты
+    # YYYY-MM-DD -> DD.MM.YYYY
     if len(s) == 10 and s[4] == "-" and s[7] == "-":
         y, m, d = s.split("-")
         if y.isdigit() and m.isdigit() and d.isdigit():
             return f"{d}.{m}.{y}"
 
-    if base in ("TradeDate", "QuikDate", "Date", "SettleDate"):
-        return format_date_string(s)
+    # YYYYMMDD -> DD.MM.YYYY
+    if base in ("TradeDate", "QuikDate", "Date", "SettleDate") \
+            and len(s) == 8 and s.isdigit():
+        return f"{s[6:8]}.{s[4:6]}.{s[0:4]}"
 
-    # время
+    # Время как есть
     if base in ("QuikTime", "ReplyTime", "Time"):
-        return s  # обычно уже HH:MM:SS.xxxxxx
+        return s
 
-    # числа
+    # Числа — убираем лишние нули
     if base in QUIK_NUMERIC_FIELDS:
-        return format_number(s)
+        try:
+            num = float(s.replace(",", "."))
+            if num == int(num):
+                return str(int(num))
+            return f"{num:g}"
+        except ValueError:
+            return s
 
     return s
 
@@ -195,10 +152,7 @@ def detect_namespace(path):
 
 
 def read_report_header(path):
-    """
-    Читает атрибуты корневого узла TransactionsReport:
-    ProgramVersion, StartDate, EndDate.
-    """
+    """Читает атрибуты корневого узла TransactionsReport."""
     info = {"ProgramVersion": "", "StartDate": "", "EndDate": ""}
     with open(path, "rb") as f:
         for _, elem in ET.iterparse(f, events=("start",)):
@@ -208,6 +162,18 @@ def read_report_header(path):
                     info[k] = v
             break
     return info
+
+
+def format_date_string(s):
+    if not s:
+        return s
+    if len(s) == 10 and s[4] == "-" and s[7] == "-":
+        y, m, d = s.split("-")
+        if y.isdigit() and m.isdigit() and d.isdigit():
+            return f"{d}.{m}.{y}"
+    if len(s) == 8 and s.isdigit():
+        return f"{s[6:8]}.{s[4:6]}.{s[0:4]}"
+    return s
 
 
 # ============================================================
@@ -304,10 +270,8 @@ def extract_records(path, record_tag, namespace=None,
                     config=None, descriptions=None,
                     progress_cb=None, cancel_flag=None, max_records=None):
     """
-    Порядок ключей в rec — строго как в XML:
-      1. Атрибуты Trans (в порядке следования).
-      2. Дочерние узлы Trans в порядке следования: текст узла → затем его атрибуты.
-      3. Только когда доходим до TransData — её Field (отсортированные по Number).
+    Порядок ключей — строго как в XML.
+    Значения берутся ТОЛЬКО из PreparedValue.
     """
     if config is None:
         config = ExtractConfig()
@@ -337,7 +301,6 @@ def extract_records(path, record_tag, namespace=None,
                 tag_local = strip_ns(child.tag)
 
                 if tag_local == config.container_tag:
-                    # 3. Field-ы внутри TransData — сортируем по Number
                     fields = list(child.findall(config.field_tag))
                     if namespace and not fields:
                         fields = list(child.findall(
@@ -353,25 +316,16 @@ def extract_records(path, record_tag, namespace=None,
                     for field in fields:
                         name = (field.get(config.name_attr) or "").strip()
                         desc = (field.get(config.description_attr) or "").strip()
-                        value = (field.get(config.value_attr) or "").strip()
                         prepared = (field.get(config.prepared_attr) or "").strip()
-                        scale_attr = (field.get("Scale") or "").strip()
 
                         if not name:
                             continue
 
-                        scale = int(scale_attr) if scale_attr.isdigit() else 0
-
                         if desc and name not in descriptions:
                             descriptions[name] = desc
 
-                        # приоритет: PreparedValue → Value
-                        if prepared:
-                            display = prepared
-                        elif scale > 0:
-                            display = format_number(value, scale)
-                        else:
-                            display = value
+                        # ТОЛЬКО PreparedValue
+                        display = prepared
 
                         if name in rec:
                             i = 2
@@ -380,9 +334,9 @@ def extract_records(path, record_tag, namespace=None,
                             rec[f"{name}_{i}"] = display
                         else:
                             rec[name] = display
-                    continue  # TransData обработана, дальше не идём
+                    continue
 
-                # обычный дочерний узел — сначала текст, потом атрибуты
+                # обычный дочерний узел — текст, потом атрибуты
                 text = (child.text or "").strip()
                 if text:
                     key = tag_local
@@ -453,15 +407,11 @@ def dump_first_record(xml_path, record_tag="Trans", namespace=None,
 
 
 # ============================================================
-# 4. КОЛОНКИ — строго по XML
+# 4. КОЛОНКИ
 # ============================================================
 
 def build_columns(records, descriptions=None):
-    """
-    Порядок ключей — как в первой записи (то есть как в XML).
-    Если в других записях встречаются новые ключи — они идут в конец
-    в порядке появления.
-    """
+    """Порядок колонок — как в первой записи (то есть как в XML)."""
     seen = {}
     for rec in records:
         for k in rec:
