@@ -29,8 +29,10 @@ from reportlab.pdfbase.ttfonts import TTFont
 
 QUIK_NS = "urn:quik:trans-info:v1.0"
 
-# Русские заголовки для типовых полей QUIK-отчёта.
+# Русские заголовки для полей QUIK.
 # Ключи — локальные имена тегов/атрибутов без namespace и без "@".
+# Можно задавать как полный путь ("TransData.AccruedInterest"),
+# так и просто имя ("AccruedInterest") — второе применяется ко всем путям.
 QUIK_FIELD_LABELS = {
     # Идентификация
     "TransId":          "ID транзакции",
@@ -75,9 +77,12 @@ QUIK_FIELD_LABELS = {
     "Inout":            "Ввод/вывод",
     "Reason":           "Основание",
     "RejectReason":     "Причина отказа",
+    # TransData — подпись для самого контейнера
+    "TransData":        "Доп. данные",
 }
 
-# Поля, которые в таблице показываем в первую очередь (если есть)
+# Поля, которые в таблице показываем в первую очередь (если есть).
+# Сравнение идёт по базовому имени (последний сегмент пути).
 QUIK_PREFERRED_ORDER = [
     "TransId", "TradeNum", "OrderNum",
     "Date", "Time", "TradeDate", "SettleDate",
@@ -89,7 +94,7 @@ QUIK_PREFERRED_ORDER = [
     "BrokerRef", "Comment",
 ]
 
-# Числовые поля QUIK — для возможной правой выключки и сортировки
+# Числовые поля QUIK — для правой выключки и форматирования.
 QUIK_NUMERIC_FIELDS = {
     "Quantity", "Price", "Volume", "Value",
     "AccruedInterest", "PosValue",
@@ -117,21 +122,33 @@ def qname(local_name, namespace):
 
 
 def base_field_name(col):
-    """col может быть '@firmCode' или 'sub.tag'. Возвращает базовое имя без @ и префикса пути."""
+    """
+    Технический ключ -> базовое имя последнего сегмента пути.
+    '@id'         -> 'id'
+    'TransData.X' -> 'X'
+    'a.b.c'       -> 'c'
+    """
     if col.startswith("@"):
         return col[1:]
     if "." in col:
-        return col.split(".")[-1]
+        last = col.split(".")[-1]
+        if last.startswith("@"):
+            return last[1:]
+        return last
     return col
 
 
 def label_for(field_name):
     """Человекочитаемый заголовок колонки."""
+    # 1) точное совпадение полного пути
+    if field_name in QUIK_FIELD_LABELS:
+        return QUIK_FIELD_LABELS[field_name]
+    # 2) по базовому имени
     base = base_field_name(field_name)
     if base in QUIK_FIELD_LABELS:
         return QUIK_FIELD_LABELS[base]
-    # если не нашли — возвращаем само имя
-    return base
+    # 3) fallback — сам путь без namespace
+    return field_name
 
 
 def format_quik_value(col, value):
@@ -141,15 +158,12 @@ def format_quik_value(col, value):
         return ""
     s = str(value).strip()
 
-    # Даты вида YYYYMMDD -> DD.MM.YYYY
     if base in ("Date", "TradeDate", "SettleDate") and len(s) == 8 and s.isdigit():
         return f"{s[6:8]}.{s[4:6]}.{s[0:4]}"
 
-    # Время HHMMSS -> HH:MM:SS
     if base == "Time" and len(s) == 6 and s.isdigit():
         return f"{s[0:2]}:{s[2:4]}:{s[4:6]}"
 
-    # Числа — заменяем запятую на точку и убираем лишние нули в дробной части
     if base in QUIK_NUMERIC_FIELDS:
         try:
             num = float(s.replace(",", "."))
@@ -187,15 +201,23 @@ def _path_under(root, node):
     return ".".join(reversed(parts)) or strip_ns(node.tag)
 
 
+def _add_field(rec, key, value):
+    """Добавляет значение, разрешая дубли через суффикс _2, _3, ..."""
+    if key not in rec:
+        rec[key] = value
+        return
+    i = 2
+    while f"{key}_{i}" in rec:
+        i += 1
+    rec[f"{key}_{i}"] = value
+
+
 # ============================================================
 # 2. АНАЛИЗ СТРУКТУРЫ XML
 # ============================================================
 
 def analyze_structure(path, sample_limit=200000):
-    """
-    Потоково собирает статистику по тегам (с namespace).
-    Возвращает dict: tag -> {"count": N, "children": Counter(...)}.
-    """
+    """Потоково собирает статистику по тегам с namespace."""
     stats = defaultdict(lambda: {"count": 0, "children": Counter()})
 
     with open(path, "rb") as f:
@@ -239,14 +261,12 @@ def detect_record_tag(stats, preferred="Trans"):
     Возвращает (namespace, local_name) тега-записи.
     Приоритет: preferred ('Trans') по локальному имени; иначе эвристика.
     """
-    # 1) ищем QUIK-специфичный тег
     for tag, info in stats.items():
         local = strip_ns(tag)
         if local == preferred and info["count"] >= 1:
             ns = tag[1:tag.index("}")] if tag.startswith("{") else None
             return ns, local
 
-    # 2) эвристика
     best = None
     best_score = 0
     for tag, info in stats.items():
@@ -269,16 +289,20 @@ def detect_record_tag(stats, preferred="Trans"):
 
 
 # ============================================================
-# 3. ИЗВЛЕЧЕНИЕ ЗАПИСЕЙ
+# 3. ИЗВЛЕЧЕНИЕ ЗАПИСЕЙ (с полным разбором вложенности)
 # ============================================================
 
 def extract_records(path, record_tag, namespace=None,
                     progress_cb=None, cancel_flag=None, max_records=None):
     """
-    Потоково извлекает записи.
-    record_tag — локальное имя ('Trans').
-    namespace — строка namespace или None.
-    Возвращает генератор dict.
+    Потоково извлекает записи. Сохраняет:
+      - атрибуты корня записи:      @attr
+      - прямой текст записи:        _text
+      - тексты любого вложенного:   path.to.field
+      - атрибуты любого вложенного: path.to.@attr
+      - хвостовой текст:            path.to._tail
+
+    Дубли разрешаются суффиксом _2, _3, ...
     """
     search_tag = qname(record_tag, namespace)
 
@@ -292,32 +316,41 @@ def extract_records(path, record_tag, namespace=None,
 
             rec = {}
 
-            # атрибуты самого элемента
+            # 1) атрибуты самой записи
             for k, v in elem.attrib.items():
                 rec[f"@{strip_ns(k)}"] = v
 
-            # вложенные поля: ключ — путь от записи
+            # 2) прямой текст записи (если есть)
+            direct_text = (elem.text or "").strip()
+            if direct_text:
+                rec["_text"] = direct_text
+
+            # 3) обход всех потомков
             for child in elem.iter():
                 if child is elem:
                     continue
                 if not isinstance(child.tag, str):
                     continue
+
+                path_to_child = _path_under(elem, child)
+
+                # 3a) текст узла
                 text = (child.text or "").strip()
                 if text:
-                    key = _path_under(elem, child)
-                    if key in rec:
-                        i = 2
-                        while f"{key}_{i}" in rec:
-                            i += 1
-                        key = f"{key}_{i}"
-                    rec[key] = text
+                    _add_field(rec, path_to_child, text)
 
-            direct_text = (elem.text or "").strip()
-            if direct_text:
-                rec["_text"] = direct_text
+                # 3b) атрибуты узла
+                for ak, av in child.attrib.items():
+                    _add_field(rec, f"{path_to_child}.@{strip_ns(ak)}", av)
+
+                # 3c) хвостовой текст
+                tail = (child.tail or "").strip()
+                if tail:
+                    _add_field(rec, f"{path_to_child}._tail", tail)
 
             yield rec
 
+            # освобождение памяти
             elem.clear()
             while elem.getprevious() is not None:
                 del elem.getparent()[0]
@@ -329,6 +362,51 @@ def extract_records(path, record_tag, namespace=None,
                 return
 
 
+def dump_first_record(xml_path, record_tag="Trans", namespace=None,
+                      max_depth=10):
+    """
+    Возвращает текстовый дамп первой записи: теги, атрибуты, текст.
+    Для диагностики — увидеть реальную структуру Trans/TransData.
+    """
+    search_tag = qname(record_tag, namespace)
+
+    with open(xml_path, "rb") as f:
+        for _, elem in ET.iterparse(f, events=("end",), tag=search_tag):
+            lines = []
+
+            def walk(node, depth=0):
+                if depth > max_depth:
+                    lines.append("  " * depth + "...")
+                    return
+                pad = "  " * depth
+                t = node.tag if isinstance(node.tag, str) else str(node.tag)
+                t = strip_ns(t)
+                attrs = " ".join(f'{strip_ns(k)}="{v}"'
+                                 for k, v in node.attrib.items())
+                text = (node.text or "").strip()
+                tail = (node.tail or "").strip()
+
+                head = f"{pad}<{t}"
+                if attrs:
+                    head += " " + attrs
+                head += ">"
+                if text:
+                    head += f" {text!r}"
+                lines.append(head)
+
+                for c in node:
+                    if not isinstance(c.tag, str):
+                        continue
+                    walk(c, depth + 1)
+
+                if tail:
+                    lines.append(f"{pad}  # tail: {tail!r}")
+
+            walk(elem)
+            return "\n".join(lines)
+    return "(записей не найдено)"
+
+
 # ============================================================
 # 4. КОЛОНКИ — сборка и упорядочивание
 # ============================================================
@@ -338,9 +416,9 @@ def build_columns(records):
     Возвращает (columns, header_map):
       columns — список технических ключей,
       header_map — {tech_key: russian_label}.
-    Порядок: сначала предпочтительные QUIK-поля, затем остальные в порядке появления.
+    Сортировка: сначала предпочтительные QUIK-поля (по базовому имени),
+    затем остальные в порядке первого появления.
     """
-    # собираем все ключи
     seen = {}
     for rec in records:
         for k in rec:
@@ -348,7 +426,6 @@ def build_columns(records):
 
     all_keys = list(seen.keys())
 
-    # предпочтительный порядок по базовому имени
     preferred = []
     others = []
     used = set()
@@ -445,7 +522,8 @@ def export_docx(xml_path, out_path, record_tag, namespace=None,
     if as_cards:
         _add_cards_docx(doc, records, columns, header_map, "Транзакции")
     else:
-        _add_table_docx(doc, records, columns, header_map, "Таблица транзакций")
+        _add_table_docx(doc, records, columns, header_map,
+                        "Таблица транзакций")
 
     doc.save(out_path)
 
@@ -473,6 +551,8 @@ HTML_HEAD = """<!DOCTYPE html>
   .card h3 {{ margin-top: 0; color: #004a99; }}
   .field {{ margin: 2px 0; }}
   .field b {{ color: #333; }}
+  details {{ margin-top: 6px; }}
+  summary {{ cursor: pointer; color: #004a99; }}
 </style></head><body>
 <h1>{title}</h1>
 <p><i>Источник: {source}<br>Записей: {count}</i></p>
@@ -516,7 +596,9 @@ def export_html(xml_path, out_path, record_tag, namespace=None,
             for rec in records:
                 f.write("<tr>")
                 for col in columns:
-                    cls = "num" if base_field_name(col) in QUIK_NUMERIC_FIELDS else ""
+                    cls = ("num"
+                           if base_field_name(col) in QUIK_NUMERIC_FIELDS
+                           else "")
                     f.write(
                         f'<td class="{cls}">'
                         f'{_esc(format_quik_value(col, rec.get(col, "")))}</td>')
@@ -565,6 +647,7 @@ def export_pdf(xml_path, out_path, record_tag, namespace=None,
 
     columns, header_map = build_columns(records)
 
+    # альбомная ориентация, если колонок много
     use_landscape = len(columns) > 5
     pagesize = landscape(A4) if use_landscape else A4
 
@@ -621,16 +704,39 @@ def export_pdf(xml_path, out_path, record_tag, namespace=None,
 # 8. GUI
 # ============================================================
 
+class DumpWindow(tk.Toplevel):
+    """Окно для показа сырой структуры первой записи."""
+    def __init__(self, master, text):
+        super().__init__(master)
+        self.title("Сырой дамп первой записи")
+        self.geometry("820x600")
+
+        frame = ttk.Frame(self)
+        frame.pack(fill="both", expand=True, padx=8, pady=8)
+
+        txt = tk.Text(frame, wrap="none", font=("Consolas", 10))
+        txt.pack(side="left", fill="both", expand=True)
+
+        sb_y = ttk.Scrollbar(frame, orient="vertical", command=txt.yview)
+        sb_y.pack(side="right", fill="y")
+        sb_x = ttk.Scrollbar(self, orient="horizontal", command=txt.xview)
+        sb_x.pack(side="bottom", fill="x")
+
+        txt.configure(yscrollcommand=sb_y.set, xscrollcommand=sb_x.set)
+        txt.insert("1.0", text)
+        txt.configure(state="disabled")
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("QUIK XML → отчёт (DOCX / PDF / HTML)")
-        self.geometry("740x600")
+        self.geometry("760x640")
         self.resizable(False, False)
 
         self.xml_path = tk.StringVar()
         self.format_var = tk.StringVar(value="html")
-        self.record_tag = tk.StringVar(value="")
+        self.record_tag = tk.StringVar(value="Trans")
         self.limit = tk.IntVar(value=100000)
         self.view_mode = tk.StringVar(value="table")
 
@@ -649,12 +755,19 @@ class App(tk.Tk):
             side="left", padx=6, pady=6, fill="x", expand=True)
         ttk.Button(frame_file, text="Обзор…", command=self.choose_file).pack(
             side="right", padx=6, pady=6)
-        ttk.Button(frame_file, text="Анализ структуры",
-                   command=self.run_analysis).pack(side="right", padx=6, pady=6)
+
+        # --- анализ ---
+        frame_an = ttk.LabelFrame(self, text="2. Диагностика")
+        frame_an.pack(fill="x", **pad)
+        ttk.Button(frame_an, text="Анализ структуры",
+                   command=self.run_analysis).pack(
+            side="left", padx=6, pady=6)
+        ttk.Button(frame_an, text="Сырой дамп первой записи",
+                   command=self.show_dump).pack(side="left", padx=6, pady=6)
 
         # --- запись ---
         frame_rec = ttk.LabelFrame(
-            self, text="2. Тег записи (по умолчанию Trans, пусто = авто)")
+            self, text="3. Тег записи (по умолчанию Trans)")
         frame_rec.pack(fill="x", **pad)
         self.cmb_tag = ttk.Combobox(frame_rec, textvariable=self.record_tag,
                                     values=[], width=40)
@@ -664,7 +777,7 @@ class App(tk.Tk):
             side="left", padx=6)
 
         # --- представление ---
-        frame_view = ttk.LabelFrame(self, text="3. Представление")
+        frame_view = ttk.LabelFrame(self, text="4. Представление")
         frame_view.pack(fill="x", **pad)
         ttk.Radiobutton(frame_view, text="Таблица",
                         value="table", variable=self.view_mode).pack(
@@ -674,7 +787,7 @@ class App(tk.Tk):
             side="left", padx=12, pady=6)
 
         # --- формат ---
-        frame_fmt = ttk.LabelFrame(self, text="4. Формат вывода")
+        frame_fmt = ttk.LabelFrame(self, text="5. Формат вывода")
         frame_fmt.pack(fill="x", **pad)
         for fmt, label in [("html", "HTML"), ("docx", "Word (.docx)"),
                            ("pdf", "PDF")]:
@@ -759,6 +872,25 @@ class App(tk.Tk):
                 self.after(0, self._show_error, "Ошибка анализа", err)
             finally:
                 self.after(0, self._reset_ui)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def show_dump(self):
+        xml_file = self.xml_path.get().strip()
+        if not xml_file or not os.path.isfile(xml_file):
+            messagebox.showwarning("Внимание", "Сначала выберите XML-файл")
+            return
+
+        tag = self.record_tag.get().strip() or "Trans"
+
+        def worker():
+            try:
+                ns = detect_namespace(xml_file)
+                dump = dump_first_record(xml_file, tag, ns)
+                self.after(0, lambda: DumpWindow(self, dump))
+            except Exception as exc:
+                err = f"{type(exc).__name__}: {exc}"
+                self.after(0, self._show_error, "Ошибка дампа", err)
 
         threading.Thread(target=worker, daemon=True).start()
 
