@@ -4,7 +4,7 @@ import threading
 from datetime import datetime
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
-from collections import defaultdict
+from collections import Counter, defaultdict
 
 from lxml import etree as ET
 
@@ -77,12 +77,6 @@ def strip_ns(tag):
     return tag
 
 
-def qname(local_name, namespace):
-    if namespace:
-        return f"{{{namespace}}}{local_name}"
-    return local_name
-
-
 def base_field_name(col):
     if col.startswith("@"):
         return col[1:]
@@ -131,17 +125,8 @@ def format_quik_value(col, value):
     return s
 
 
-def detect_namespace(path):
-    with open(path, "rb") as f:
-        for _, elem in ET.iterparse(f, events=("start",)):
-            tag = elem.tag
-            if isinstance(tag, str) and tag.startswith("{"):
-                return tag.split("}", 1)[0][1:]
-            return None
-    return None
-
-
 def read_report_header(path):
+    """Читает атрибуты корневого узла TransactionsReport."""
     info = {"ProgramVersion": "", "StartDate": "", "EndDate": ""}
     with open(path, "rb") as f:
         for _, elem in ET.iterparse(f, events=("start",)):
@@ -177,22 +162,28 @@ def extract_records(path, record_tag=RECORD_TAG, namespace=None,
                     descriptions=None,
                     progress_cb=None, cancel_flag=None, max_records=None):
     """
-    Извлекает записи <Trans>.
-    TransData и Field ищутся через XPath с local-name(),
-    на любой глубине внутри Trans — независимо от namespace.
+    Потоково извлекает записи <Trans>.
+    Поиск Trans и TransData/Field идёт по локальному имени (local-name),
+    независимо от namespace — работает и с xmlns, и без него.
+    Значения из Field берутся ТОЛЬКО из PreparedValue.
+    Пустые узлы Trans тоже сохраняются (станут «—» в отчёте).
     """
     if descriptions is None:
         descriptions = {}
 
-    search_tag = qname(record_tag, namespace)
-
     with open(path, "rb") as f:
-        context = ET.iterparse(f, events=("end",), tag=search_tag)
+        # iterparse без tag — фильтруем по локальному имени
+        context = ET.iterparse(f, events=("end",))
 
         count = 0
         for _, elem in context:
             if cancel_flag and cancel_flag.is_set():
                 return
+
+            if not isinstance(elem.tag, str):
+                continue
+            if strip_ns(elem.tag) != record_tag:
+                continue
 
             rec = {}
 
@@ -200,50 +191,47 @@ def extract_records(path, record_tag=RECORD_TAG, namespace=None,
             for k, v in elem.attrib.items():
                 rec[f"@{strip_ns(k)}"] = v
 
-            # 2. TransData -> Field (на любой глубине)
-            containers = elem.xpath(".//*[local-name()='TransData']")
-
-            for container in containers:
-                fields = container.xpath(".//*[local-name()='Field']")
-
-                def _num_key(fe):
-                    try:
-                        return int(fe.get("Number") or 0)
-                    except ValueError:
-                        return 0
-                fields.sort(key=_num_key)
-
-                for field in fields:
-                    name = (field.get(NAME_ATTR) or "").strip()
-                    desc = (field.get(DESC_ATTR) or "").strip()
-                    prepared = (field.get(PREPARED_ATTR) or "").strip()
-
-                    if not name:
-                        continue
-
-                    if desc and name not in descriptions:
-                        descriptions[name] = desc
-
-                    display = prepared
-
-                    if name in rec:
-                        i = 2
-                        while f"{name}_{i}" in rec:
-                            i += 1
-                        rec[f"{name}_{i}"] = display
-                    else:
-                        rec[name] = display
-
-            # 3. Остальные дочерние узлы Trans (кроме TransData)
+            # 2. Обход детей Trans в порядке XML
             for child in elem:
                 if not isinstance(child.tag, str):
                     continue
                 tag_local = strip_ns(child.tag)
 
                 if tag_local == CONTAINER_TAG:
+                    # Field внутри TransData — независимо от namespace
+                    fields = child.xpath(f".//*[local-name()='{FIELD_TAG}']")
+
+                    def _num_key(fe):
+                        try:
+                            return int(fe.get("Number") or 0)
+                        except ValueError:
+                            return 0
+                    fields.sort(key=_num_key)
+
+                    for field in fields:
+                        name = (field.get(NAME_ATTR) or "").strip()
+                        desc = (field.get(DESC_ATTR) or "").strip()
+                        prepared = (field.get(PREPARED_ATTR) or "").strip()
+
+                        if not name:
+                            continue
+
+                        if desc and name not in descriptions:
+                            descriptions[name] = desc
+
+                        # ТОЛЬКО PreparedValue
+                        display = prepared
+
+                        if name in rec:
+                            i = 2
+                            while f"{name}_{i}" in rec:
+                                i += 1
+                            rec[f"{name}_{i}"] = display
+                        else:
+                            rec[name] = display
                     continue
 
-                # обычный узел — текст, потом атрибуты
+                # обычный дочерний узел — текст, потом атрибуты
                 text = (child.text or "").strip()
                 if tag_local not in rec:
                     rec[tag_local] = text
@@ -281,7 +269,10 @@ def extract_records(path, record_tag=RECORD_TAG, namespace=None,
 # ============================================================
 
 def build_columns(records, descriptions=None, min_fill_ratio=MIN_FILL_RATIO):
-    """Порог по наличию ключа (не по непустому значению)."""
+    """
+    Оставляем колонки, которые присутствуют в КАЖДОЙ записи
+    (наличие ключа, а не непустое значение).
+    """
     if not records:
         return [], {}
 
@@ -341,14 +332,13 @@ def _esc(s):
     return html.escape(str(s))
 
 
-def export_html(xml_path, out_path, namespace=None,
-                limit=DEFAULT_LIMIT, progress_cb=None,
-                cancel_flag=None, as_cards=False):
+def export_html(xml_path, out_path, limit=DEFAULT_LIMIT,
+                progress_cb=None, cancel_flag=None, as_cards=False):
     header = read_report_header(xml_path)
 
     descriptions = {}
     records = list(extract_records(
-        xml_path, RECORD_TAG, namespace,
+        xml_path, RECORD_TAG,
         descriptions=descriptions,
         progress_cb=progress_cb, cancel_flag=cancel_flag,
         max_records=limit))
@@ -427,9 +417,8 @@ def register_cyrillic_font():
     return "Helvetica"
 
 
-def export_pdf(xml_path, out_path, namespace=None,
-               limit=DEFAULT_LIMIT, progress_cb=None,
-               cancel_flag=None, as_cards=False):
+def export_pdf(xml_path, out_path, limit=DEFAULT_LIMIT,
+               progress_cb=None, cancel_flag=None, as_cards=False):
     font = register_cyrillic_font()
 
     styles = getSampleStyleSheet()
@@ -444,7 +433,7 @@ def export_pdf(xml_path, out_path, namespace=None,
 
     descriptions = {}
     records = list(extract_records(
-        xml_path, RECORD_TAG, namespace,
+        xml_path, RECORD_TAG,
         descriptions=descriptions,
         progress_cb=progress_cb, cancel_flag=cancel_flag,
         max_records=limit))
@@ -636,24 +625,19 @@ class App(tk.Tk):
 
         def worker():
             try:
-                namespace = detect_namespace(xml_file)
-                self._set_status(
-                    f"Namespace: {namespace or '—'}. Разбор транзакций…",
-                    "blue")
+                self._set_status("Разбор транзакций…", "blue")
 
                 if self.cancel_flag.is_set():
                     raise RuntimeError("Отменено")
 
                 if fmt == "html":
                     export_html(xml_file, out_path,
-                                namespace=namespace,
                                 limit=DEFAULT_LIMIT,
                                 progress_cb=self._progress_cb,
                                 cancel_flag=self.cancel_flag,
                                 as_cards=as_cards)
                 elif fmt == "pdf":
                     export_pdf(xml_file, out_path,
-                               namespace=namespace,
                                limit=DEFAULT_LIMIT,
                                progress_cb=self._progress_cb,
                                cancel_flag=self.cancel_flag,
