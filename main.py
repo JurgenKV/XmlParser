@@ -4,7 +4,6 @@ import threading
 from datetime import datetime
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
-from collections import Counter, defaultdict
 
 from lxml import etree as ET
 
@@ -20,19 +19,19 @@ from reportlab.pdfbase.ttfonts import TTFont
 
 
 # ============================================================
-# 0. КОНСТАНТЫ
+# 0. КОНСТАНТЫ (раньше были настраиваемыми в UI)
 # ============================================================
+
+QUIK_NS = "urn:quik:trans-info:v1.0"
 
 RECORD_TAG = "Trans"
 CONTAINER_TAG = "TransData"
 FIELD_TAG = "Field"
 NAME_ATTR = "Name"
 DESC_ATTR = "Description"
+VALUE_ATTR = "Value"
 PREPARED_ATTR = "PreparedValue"
-
 DEFAULT_LIMIT = 1000000
-MIN_FILL_RATIO = 1.0
-EMPTY_MARK = "—"
 
 QUIK_FIELD_LABELS = {
     "@TransNum":   "№ транзакции",
@@ -77,6 +76,12 @@ def strip_ns(tag):
     return tag
 
 
+def qname(local_name, namespace):
+    if namespace:
+        return f"{{{namespace}}}{local_name}"
+    return local_name
+
+
 def base_field_name(col):
     if col.startswith("@"):
         return col[1:]
@@ -103,13 +108,13 @@ def label_for(field_name, descriptions=None):
 
 
 def format_quik_value(col, value):
-    """Показывает PreparedValue как есть; пустое -> «—»."""
+    """Форматирование PreparedValue для вывода."""
     base = base_field_name(col)
     if value is None:
-        return EMPTY_MARK
+        return ""
     s = str(value).strip()
     if not s:
-        return EMPTY_MARK
+        return ""
 
     # YYYY-MM-DD -> DD.MM.YYYY
     if len(s) == 10 and s[4] == "-" and s[7] == "-":
@@ -122,7 +127,31 @@ def format_quik_value(col, value):
             and len(s) == 8 and s.isdigit():
         return f"{s[6:8]}.{s[4:6]}.{s[0:4]}"
 
+    # Время как есть
+    if base in ("QuikTime", "ReplyTime", "Time"):
+        return s
+
+    # Числа — убираем лишние нули
+    if base in QUIK_NUMERIC_FIELDS:
+        try:
+            num = float(s.replace(",", "."))
+            if num == int(num):
+                return str(int(num))
+            return f"{num:g}"
+        except ValueError:
+            return s
+
     return s
+
+
+def detect_namespace(path):
+    with open(path, "rb") as f:
+        for _, elem in ET.iterparse(f, events=("start",)):
+            tag = elem.tag
+            if isinstance(tag, str) and tag.startswith("{"):
+                return tag.split("}", 1)[0][1:]
+            return None
+    return None
 
 
 def read_report_header(path):
@@ -150,40 +179,51 @@ def format_date_string(s):
     return s
 
 
-def _is_empty(value):
-    return value is None or str(value).strip() == ""
+# ============================================================
+# 2. КОНФИГ ИЗВЛЕЧЕНИЯ (параметры зашиты)
+# ============================================================
+
+class ExtractConfig:
+    def __init__(self,
+                 container_tag=CONTAINER_TAG,
+                 field_tag=FIELD_TAG,
+                 name_attr=NAME_ATTR,
+                 description_attr=DESC_ATTR,
+                 value_attr=VALUE_ATTR,
+                 prepared_attr=PREPARED_ATTR):
+        self.container_tag = container_tag
+        self.field_tag = field_tag
+        self.name_attr = name_attr
+        self.description_attr = description_attr
+        self.value_attr = value_attr
+        self.prepared_attr = prepared_attr
 
 
 # ============================================================
-# 2. ИЗВЛЕЧЕНИЕ ЗАПИСЕЙ
+# 3. ИЗВЛЕЧЕНИЕ ЗАПИСЕЙ
 # ============================================================
 
 def extract_records(path, record_tag=RECORD_TAG, namespace=None,
-                    descriptions=None,
+                    config=None, descriptions=None,
                     progress_cb=None, cancel_flag=None, max_records=None):
     """
-    Потоково извлекает записи <Trans>.
-    Поиск Trans и TransData/Field идёт по локальному имени (local-name),
-    независимо от namespace — работает и с xmlns, и без него.
-    Значения из Field берутся ТОЛЬКО из PreparedValue.
-    Пустые узлы Trans тоже сохраняются (станут «—» в отчёте).
+    Порядок ключей — строго как в XML.
+    Значения из TransData/Field берутся ТОЛЬКО из PreparedValue.
     """
+    if config is None:
+        config = ExtractConfig()
     if descriptions is None:
         descriptions = {}
 
+    search_tag = qname(record_tag, namespace)
+
     with open(path, "rb") as f:
-        # iterparse без tag — фильтруем по локальному имени
-        context = ET.iterparse(f, events=("end",))
+        context = ET.iterparse(f, events=("end",), tag=search_tag)
 
         count = 0
         for _, elem in context:
             if cancel_flag and cancel_flag.is_set():
                 return
-
-            if not isinstance(elem.tag, str):
-                continue
-            if strip_ns(elem.tag) != record_tag:
-                continue
 
             rec = {}
 
@@ -197,9 +237,11 @@ def extract_records(path, record_tag=RECORD_TAG, namespace=None,
                     continue
                 tag_local = strip_ns(child.tag)
 
-                if tag_local == CONTAINER_TAG:
-                    # Field внутри TransData — независимо от namespace
-                    fields = child.xpath(f".//*[local-name()='{FIELD_TAG}']")
+                if tag_local == config.container_tag:
+                    fields = list(child.findall(config.field_tag))
+                    if namespace and not fields:
+                        fields = list(child.findall(
+                            f"{{{namespace}}}{config.field_tag}"))
 
                     def _num_key(fe):
                         try:
@@ -209,9 +251,9 @@ def extract_records(path, record_tag=RECORD_TAG, namespace=None,
                     fields.sort(key=_num_key)
 
                     for field in fields:
-                        name = (field.get(NAME_ATTR) or "").strip()
-                        desc = (field.get(DESC_ATTR) or "").strip()
-                        prepared = (field.get(PREPARED_ATTR) or "").strip()
+                        name = (field.get(config.name_attr) or "").strip()
+                        desc = (field.get(config.description_attr) or "").strip()
+                        prepared = (field.get(config.prepared_attr) or "").strip()
 
                         if not name:
                             continue
@@ -233,13 +275,15 @@ def extract_records(path, record_tag=RECORD_TAG, namespace=None,
 
                 # обычный дочерний узел — текст, потом атрибуты
                 text = (child.text or "").strip()
-                if tag_local not in rec:
-                    rec[tag_local] = text
-                else:
-                    i = 2
-                    while f"{tag_local}_{i}" in rec:
-                        i += 1
-                    rec[f"{tag_local}_{i}"] = text
+                if text:
+                    key = tag_local
+                    if key in rec:
+                        i = 2
+                        while f"{key}_{i}" in rec:
+                            i += 1
+                        rec[f"{key}_{i}"] = text
+                    else:
+                        rec[key] = text
 
                 for ak, av in child.attrib.items():
                     key = f"{tag_local}.@{strip_ns(ak)}"
@@ -265,39 +309,24 @@ def extract_records(path, record_tag=RECORD_TAG, namespace=None,
 
 
 # ============================================================
-# 3. КОЛОНКИ
+# 4. КОЛОНКИ
 # ============================================================
 
-def build_columns(records, descriptions=None, min_fill_ratio=MIN_FILL_RATIO):
-    """
-    Оставляем колонки, которые присутствуют в КАЖДОЙ записи
-    (наличие ключа, а не непустое значение).
-    """
-    if not records:
-        return [], {}
-
-    total = len(records)
-    counts = defaultdict(int)
-    order = {}
-
+def build_columns(records, descriptions=None):
+    """Порядок колонок — как в первой записи (то есть как в XML)."""
+    seen = {}
     for rec in records:
         for k in rec:
-            if k not in order:
-                order[k] = len(order)
-            counts[k] += 1
+            if k not in seen:
+                seen[k] = True
 
-    ordered_keys = sorted(order, key=order.get)
-    columns = [
-        k for k in ordered_keys
-        if counts.get(k, 0) / total >= min_fill_ratio
-    ]
-
+    columns = list(seen.keys())
     header_map = {c: label_for(c, descriptions) for c in columns}
     return columns, header_map
 
 
 # ============================================================
-# 4. HTML
+# 5. HTML
 # ============================================================
 
 HTML_HEAD = """<!DOCTYPE html>
@@ -315,13 +344,11 @@ HTML_HEAD = """<!DOCTYPE html>
   th {{ background: #f0f4f8; position: sticky; top: 0; }}
   tr:nth-child(even) {{ background: #fafbfc; }}
   td.num {{ text-align: right; font-variant-numeric: tabular-nums; }}
-  td.empty {{ color: #999; }}
   .card {{ border: 1px solid #ddd; border-radius: 6px; padding: 12px 16px;
            margin: 8px 0; background: #fafbfc; }}
   .card h3 {{ margin-top: 0; color: #004a99; }}
   .field {{ margin: 2px 0; }}
   .field b {{ color: #333; }}
-  .field .empty {{ color: #999; }}
 </style></head><body>
 <h1>{title}</h1>
 <div class="meta">{meta}</div>
@@ -332,14 +359,15 @@ def _esc(s):
     return html.escape(str(s))
 
 
-def export_html(xml_path, out_path, limit=DEFAULT_LIMIT,
-                progress_cb=None, cancel_flag=None, as_cards=False):
+def export_html(xml_path, out_path, record_tag=RECORD_TAG, namespace=None,
+                config=None, limit=DEFAULT_LIMIT, progress_cb=None,
+                cancel_flag=None, as_cards=False):
     header = read_report_header(xml_path)
 
     descriptions = {}
     records = list(extract_records(
-        xml_path, RECORD_TAG,
-        descriptions=descriptions,
+        xml_path, record_tag, namespace,
+        config=config, descriptions=descriptions,
         progress_cb=progress_cb, cancel_flag=cancel_flag,
         max_records=limit))
 
@@ -367,12 +395,10 @@ def export_html(xml_path, out_path, limit=DEFAULT_LIMIT,
             for i, rec in enumerate(records, 1):
                 f.write(f'<div class="card"><h3>Запись {i}</h3>\n')
                 for col in columns:
-                    raw = rec.get(col, "")
-                    val = format_quik_value(col, raw)
-                    css = ' class="empty"' if _is_empty(raw) else ""
-                    f.write(
-                        f'<div class="field"><b>{_esc(header_map[col])}:</b> '
-                        f'<span{css}>{_esc(val)}</span></div>\n')
+                    if col in rec:
+                        f.write(
+                            f'<div class="field"><b>{_esc(header_map[col])}:</b> '
+                            f'{_esc(format_quik_value(col, rec[col]))}</div>\n')
                 f.write("</div>\n")
         else:
             f.write("<table><thead><tr>")
@@ -382,15 +408,12 @@ def export_html(xml_path, out_path, limit=DEFAULT_LIMIT,
             for rec in records:
                 f.write("<tr>")
                 for col in columns:
-                    raw = rec.get(col, "")
-                    val = format_quik_value(col, raw)
-                    classes = []
-                    if base_field_name(col) in QUIK_NUMERIC_FIELDS:
-                        classes.append("num")
-                    if _is_empty(raw):
-                        classes.append("empty")
-                    cls_attr = f' class="{" ".join(classes)}"' if classes else ""
-                    f.write(f'<td{cls_attr}>{_esc(val)}</td>')
+                    cls = ("num"
+                           if base_field_name(col) in QUIK_NUMERIC_FIELDS
+                           else "")
+                    f.write(
+                        f'<td class="{cls}">'
+                        f'{_esc(format_quik_value(col, rec.get(col, "")))}</td>')
                 f.write("</tr>\n")
             f.write("</tbody></table>\n")
 
@@ -398,7 +421,7 @@ def export_html(xml_path, out_path, limit=DEFAULT_LIMIT,
 
 
 # ============================================================
-# 5. PDF
+# 6. PDF
 # ============================================================
 
 def register_cyrillic_font():
@@ -417,8 +440,9 @@ def register_cyrillic_font():
     return "Helvetica"
 
 
-def export_pdf(xml_path, out_path, limit=DEFAULT_LIMIT,
-               progress_cb=None, cancel_flag=None, as_cards=False):
+def export_pdf(xml_path, out_path, record_tag=RECORD_TAG, namespace=None,
+               config=None, limit=DEFAULT_LIMIT, progress_cb=None,
+               cancel_flag=None, as_cards=False):
     font = register_cyrillic_font()
 
     styles = getSampleStyleSheet()
@@ -433,8 +457,8 @@ def export_pdf(xml_path, out_path, limit=DEFAULT_LIMIT,
 
     descriptions = {}
     records = list(extract_records(
-        xml_path, RECORD_TAG,
-        descriptions=descriptions,
+        xml_path, record_tag, namespace,
+        config=config, descriptions=descriptions,
         progress_cb=progress_cb, cancel_flag=cancel_flag,
         max_records=limit))
 
@@ -472,29 +496,19 @@ def export_pdf(xml_path, out_path, limit=DEFAULT_LIMIT,
         for i, rec in enumerate(records, 1):
             story.append(Paragraph(f"<b>Запись {i}</b>", normal))
             for col in columns:
-                raw = rec.get(col, "")
-                val = format_quik_value(col, raw)
-                if _is_empty(raw):
-                    val_html = f'<font color="#999">{_esc(val)}</font>'
-                else:
-                    val_html = _esc(val)
-                story.append(Paragraph(
-                    f"<b>{_esc(header_map[col])}:</b> {val_html}", normal))
+                if col in rec:
+                    story.append(Paragraph(
+                        f"<b>{_esc(header_map[col])}:</b> "
+                        f"{_esc(format_quik_value(col, rec[col]))}", normal))
             story.append(Spacer(1, 6))
     else:
         data = [[Paragraph(f"<b>{_esc(header_map[c])}</b>", normal)
                  for c in columns]]
         for rec in records:
-            row = []
-            for c in columns:
-                raw = rec.get(c, "")
-                val = format_quik_value(c, raw)
-                if _is_empty(raw):
-                    row.append(Paragraph(
-                        f'<font color="#999">{_esc(val)}</font>', normal))
-                else:
-                    row.append(Paragraph(_esc(val), normal))
-            data.append(row)
+            data.append([
+                Paragraph(_esc(format_quik_value(c, rec.get(c, ""))), normal)
+                for c in columns
+            ])
 
         avail = (pagesize[0] - 2.4 * cm) / max(len(columns), 1)
         col_widths = [avail] * len(columns)
@@ -515,7 +529,7 @@ def export_pdf(xml_path, out_path, limit=DEFAULT_LIMIT,
 
 
 # ============================================================
-# 6. GUI
+# 7. GUI
 # ============================================================
 
 class App(tk.Tk):
@@ -527,7 +541,7 @@ class App(tk.Tk):
 
         self.xml_path = tk.StringVar()
         self.format_var = tk.StringVar(value="html")
-        self.view_mode = tk.StringVar(value="cards")
+        self.view_mode = tk.StringVar(value="cards")  # Карточки по умолчанию
 
         self.cancel_flag = threading.Event()
 
@@ -544,7 +558,7 @@ class App(tk.Tk):
         ttk.Button(frame_file, text="Обзор…", command=self.choose_file).pack(
             side="right", padx=6, pady=6)
 
-        # 2. Представление (Карточки по умолчанию)
+        # 2. Представление (Карточки первыми, по умолчанию выбраны)
         frame_view = ttk.LabelFrame(self, text="2. Представление")
         frame_view.pack(fill="x", **pad)
         ttk.Radiobutton(frame_view, text="Карточки",
@@ -607,6 +621,7 @@ class App(tk.Tk):
         fmt = self.format_var.get()
         ext = fmt
         as_cards = self.view_mode.get() == "cards"
+        config = ExtractConfig()
 
         out_path = filedialog.asksaveasfilename(
             title="Сохранить как",
@@ -625,19 +640,24 @@ class App(tk.Tk):
 
         def worker():
             try:
-                self._set_status("Разбор транзакций…", "blue")
+                namespace = detect_namespace(xml_file)
+                self._set_status(
+                    f"Namespace: {namespace or '—'}. Разбор транзакций…",
+                    "blue")
 
                 if self.cancel_flag.is_set():
                     raise RuntimeError("Отменено")
 
                 if fmt == "html":
-                    export_html(xml_file, out_path,
+                    export_html(xml_file, out_path, RECORD_TAG,
+                                namespace=namespace, config=config,
                                 limit=DEFAULT_LIMIT,
                                 progress_cb=self._progress_cb,
                                 cancel_flag=self.cancel_flag,
                                 as_cards=as_cards)
                 elif fmt == "pdf":
-                    export_pdf(xml_file, out_path,
+                    export_pdf(xml_file, out_path, RECORD_TAG,
+                               namespace=namespace, config=config,
                                limit=DEFAULT_LIMIT,
                                progress_cb=self._progress_cb,
                                cancel_flag=self.cancel_flag,
