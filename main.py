@@ -1,6 +1,7 @@
 import os
 import html
 import threading
+from datetime import datetime
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from collections import Counter, defaultdict
@@ -29,44 +30,39 @@ from reportlab.pdfbase.ttfonts import TTFont
 
 QUIK_NS = "urn:quik:trans-info:v1.0"
 
-# Русские подписи для служебных колонок
+# Точные ключи (совпадают с тем, что реально кладётся в rec)
 QUIK_FIELD_LABELS = {
-    "@TransNum":    "№ транзакции",
-    "@UID":         "UID",
-    "@TransID":     "ID транзакции",
-    "@SessionID":   "ID сессии",
-    "@TradeDate":   "Дата сделки",
-    "@Status":      "Статус",
-    "@QuikDate":    "Дата QUIK",
-    "@QuikTime":    "Время QUIK",
-    "@ReplyTime":   "Время ответа",
-    "@OrderNum":    "№ заявки",
-    "@ClientCode":  "Код клиента",
-    "Data":         "Данные",
-    "Reply":        "Ответ",
-    "PureData":     "PureData",
-    "UserInfo.Name1":   "Имя 1",
-    "UserInfo.Name2":   "Имя 2",
-    "UserInfo.Name3":   "Имя 3",
-    "UserInfo.OrgCode": "Код организации",
-    "UserInfo.OrgName": "Организация",
-    "UserInfo.Login":   "Логин",
+    # Атрибуты Trans
+    "@TransNum":   "№ транзакции",
+    "@UID":        "UID",
+    "@TransID":    "ID транзакции",
+    "@SessionID":  "ID сессии",
+    "@TradeDate":  "Дата сделки",
+    "@Status":     "Статус",
+    "@QuikDate":   "Дата QUIK",
+    "@QuikTime":   "Время QUIK",
+    "@ReplyTime":  "Время ответа",
+    "@OrderNum":   "№ заявки",
+    "@ClientCode": "Код клиента",
+
+    # Текстовые потомки Trans
+    "Data":     "Данные",
+    "Reply":    "Ответ",
+    "PureData": "PureData",
+
+    # Атрибуты UserInfo
+    "UserInfo.@Name1":   "Имя 1",
+    "UserInfo.@Name2":   "Имя 2",
+    "UserInfo.@Name3":   "Имя 3",
+    "UserInfo.@OrgCode": "Код организации",
+    "UserInfo.@OrgName": "Организация",
+    "UserInfo.@Login":   "Логин",
 }
 
-# Порядок отображения полей в таблице
-QUIK_PREFERRED_ORDER = [
-    "@TransNum", "@TransID", "@UID", "@SessionID",
-    "@TradeDate", "@QuikDate", "@QuikTime", "@Status",
-    "@OrderNum", "@ClientCode", "@ReplyTime",
-    "UserInfo.OrgName", "UserInfo.OrgCode", "UserInfo.Name3", "UserInfo.Login",
-    "SECCODE", "BUYSELL", "MKTLIMIT",
-    "PRICE", "QUANTITY", "ORDERVALUE",
-    "ACCOUNT", "BROKERREF", "SECBOARD",
-    "Data", "Reply",
-]
-
+# Числовые поля QUIK (для отображения чисел, даже если PreparedValue вдруг пустое)
 QUIK_NUMERIC_FIELDS = {
     "PRICE", "QUANTITY", "ORDERVALUE", "VALUE", "VOLUME",
+    "ACCruedInterest", "AccruedInterest",
 }
 
 
@@ -89,7 +85,7 @@ def qname(local_name, namespace):
 
 
 def base_field_name(col):
-    """'@TransID' -> 'TransID'; 'UserInfo.OrgName' -> 'OrgName'."""
+    """'@TransID' -> 'TransID'; 'UserInfo.@Login' -> 'Login'."""
     if col.startswith("@"):
         return col[1:]
     if "." in col:
@@ -101,42 +97,89 @@ def base_field_name(col):
 
 
 def label_for(field_name, descriptions=None):
+    # 1) точный ключ
     if field_name in QUIK_FIELD_LABELS:
         return QUIK_FIELD_LABELS[field_name]
+
+    # 2) базовое имя
     base = base_field_name(field_name)
     if base in QUIK_FIELD_LABELS:
         return QUIK_FIELD_LABELS[base]
-    if descriptions and field_name in descriptions:
-        return descriptions[field_name]
-    if descriptions and base in descriptions:
-        return descriptions[base]
+
+    # 3) Description из TransData/Field
+    if descriptions:
+        if field_name in descriptions:
+            return descriptions[field_name]
+        if base in descriptions:
+            return descriptions[base]
+
+    # 4) fallback — вернуть как есть
     return field_name
 
 
-def format_quik_value(col, value):
+def format_date_string(s):
+    """YYYY-MM-DD или YYYYMMDD -> DD.MM.YYYY"""
+    if not s:
+        return s
+    if len(s) == 10 and s[4] == "-" and s[7] == "-":
+        y, m, d = s.split("-")
+        if y.isdigit() and m.isdigit() and d.isdigit():
+            return f"{d}.{m}.{y}"
+    if len(s) == 8 and s.isdigit():
+        return f"{s[6:8]}.{s[4:6]}.{s[0:4]}"
+    return s
+
+
+def format_number(value, scale=None):
+    """Форматирует число с учётом Scale (кол-во знаков после запятой)."""
+    if value is None or value == "":
+        return ""
+    s = str(value).strip().replace(",", ".")
+    # если scale > 0 — QUIK хранит как целое, делим на 10^scale
+    if scale and scale > 0:
+        try:
+            num = float(s) / (10 ** scale)
+            return f"{num:.{scale}f}".rstrip("0").rstrip(".")
+        except ValueError:
+            pass
+    # обычное число
+    try:
+        num = float(s)
+        if num == int(num):
+            return str(int(num))
+        return f"{num:g}"
+    except ValueError:
+        return s
+
+
+def format_quik_value(col, value, numeric_types=None):
+    """
+    Форматирует значение.
+    col — ключ колонки,
+    value — уже подготовленное к отображению (обычно PreparedValue),
+    numeric_types — не используется (оставлено для совместимости).
+    """
     base = base_field_name(col)
     if value is None:
         return ""
     s = str(value).strip()
 
-    # YYYY-MM-DD -> DD.MM.YYYY
+    # даты
     if len(s) == 10 and s[4] == "-" and s[7] == "-":
         y, m, d = s.split("-")
         if y.isdigit() and m.isdigit() and d.isdigit():
             return f"{d}.{m}.{y}"
 
-    # YYYYMMDD -> DD.MM.YYYY
-    if base in ("Date", "TradeDate", "SettleDate") and len(s) == 8 and s.isdigit():
-        return f"{s[6:8]}.{s[4:6]}.{s[0:4]}"
+    if base in ("TradeDate", "QuikDate", "Date", "SettleDate"):
+        return format_date_string(s)
 
+    # время
+    if base in ("QuikTime", "ReplyTime", "Time"):
+        return s  # обычно уже HH:MM:SS.xxxxxx
+
+    # числа
     if base in QUIK_NUMERIC_FIELDS:
-        try:
-            num = float(s.replace(",", "."))
-            if num == int(num):
-                return str(int(num))
-            return f"{num:g}"
-        except ValueError:
-            return s
+        return format_number(s)
 
     return s
 
@@ -149,6 +192,22 @@ def detect_namespace(path):
                 return tag.split("}", 1)[0][1:]
             return None
     return None
+
+
+def read_report_header(path):
+    """
+    Читает атрибуты корневого узла TransactionsReport:
+    ProgramVersion, StartDate, EndDate.
+    """
+    info = {"ProgramVersion": "", "StartDate": "", "EndDate": ""}
+    with open(path, "rb") as f:
+        for _, elem in ET.iterparse(f, events=("start",)):
+            for k in ("ProgramVersion", "StartDate", "EndDate"):
+                v = elem.get(k)
+                if v:
+                    info[k] = v
+            break
+    return info
 
 
 # ============================================================
@@ -245,20 +304,10 @@ def extract_records(path, record_tag, namespace=None,
                     config=None, descriptions=None,
                     progress_cb=None, cancel_flag=None, max_records=None):
     """
-    Извлекает записи из QUIK XML.
-
-    Правила:
-      1. Атрибуты самой <Trans> -> "@attr" (напр. "@TransID").
-      2. Дочерние узлы, у которых всё в атрибутах (напр. <UserInfo>)
-         -> "Тег.@атрибут" (напр. "UserInfo.OrgName").
-      3. Дочерние узлы с текстом (напр. <Data>, <Reply>)
-         -> ключ = имя тега, значение = текст.
-      4. Внутри <TransData> находим <Field>:
-         - Name, Description, Value, PreparedValue — атрибуты,
-         - ключ колонки = Name,
-         - значение = PreparedValue (если пусто — Value),
-         - Description запоминается в descriptions для заголовка колонки.
-      5. Сам TransData и Field в плоский обход НЕ попадают.
+    Порядок ключей в rec — строго как в XML:
+      1. Атрибуты Trans (в порядке следования).
+      2. Дочерние узлы Trans в порядке следования: текст узла → затем его атрибуты.
+      3. Только когда доходим до TransData — её Field (отсортированные по Number).
     """
     if config is None:
         config = ExtractConfig()
@@ -277,73 +326,63 @@ def extract_records(path, record_tag, namespace=None,
 
             rec = {}
 
-            # 1. атрибуты самой записи
+            # 1. Атрибуты Trans
             for k, v in elem.attrib.items():
                 rec[f"@{strip_ns(k)}"] = v
 
-            # 2. TransData -> Field (атрибуты)
-            handled = set()
-
-            containers = elem.findall(f".//{config.container_tag}")
-            if namespace and not containers:
-                containers = elem.findall(
-                    f".//{{{namespace}}}{config.container_tag}")
-
-            for container in containers:
-                handled.add(id(container))
-
-                fields = container.findall(config.field_tag)
-                if namespace and not fields:
-                    fields = container.findall(
-                        f"{{{namespace}}}{config.field_tag}")
-
-                for field in fields:
-                    handled.add(id(field))
-
-                    name = (field.get(config.name_attr) or "").strip()
-                    desc = (field.get(config.description_attr) or "").strip()
-                    value = (field.get(config.value_attr) or "").strip()
-                    prepared = (field.get(config.prepared_attr) or "").strip()
-
-                    if not name:
-                        continue
-
-                    display_value = prepared if prepared else value
-
-                    if desc and name not in descriptions:
-                        descriptions[name] = desc
-
-                    if name in rec:
-                        i = 2
-                        while f"{name}_{i}" in rec:
-                            i += 1
-                        rec[f"{name}_{i}"] = display_value
-                    else:
-                        rec[name] = display_value
-
-            # 3. остальные потомки (кроме содержимого TransData)
-            for child in elem.iter():
-                if child is elem:
-                    continue
+            # 2. Обход детей Trans в порядке XML
+            for child in elem:
                 if not isinstance(child.tag, str):
                     continue
-                if id(child) in handled:
-                    continue
-
-                # пропускаем всё, что внутри TransData
-                in_container = False
-                cur = child
-                while cur is not None and cur is not elem:
-                    if strip_ns(cur.tag) == config.container_tag:
-                        in_container = True
-                        break
-                    cur = cur.getparent()
-                if in_container:
-                    continue
-
                 tag_local = strip_ns(child.tag)
 
-                # текст узла
+                if tag_local == config.container_tag:
+                    # 3. Field-ы внутри TransData — сортируем по Number
+                    fields = list(child.findall(config.field_tag))
+                    if namespace and not fields:
+                        fields = list(child.findall(
+                            f"{{{namespace}}}{config.field_tag}"))
+
+                    def _num_key(fe):
+                        try:
+                            return int(fe.get("Number") or 0)
+                        except ValueError:
+                            return 0
+                    fields.sort(key=_num_key)
+
+                    for field in fields:
+                        name = (field.get(config.name_attr) or "").strip()
+                        desc = (field.get(config.description_attr) or "").strip()
+                        value = (field.get(config.value_attr) or "").strip()
+                        prepared = (field.get(config.prepared_attr) or "").strip()
+                        scale_attr = (field.get("Scale") or "").strip()
+
+                        if not name:
+                            continue
+
+                        scale = int(scale_attr) if scale_attr.isdigit() else 0
+
+                        if desc and name not in descriptions:
+                            descriptions[name] = desc
+
+                        # приоритет: PreparedValue → Value
+                        if prepared:
+                            display = prepared
+                        elif scale > 0:
+                            display = format_number(value, scale)
+                        else:
+                            display = value
+
+                        if name in rec:
+                            i = 2
+                            while f"{name}_{i}" in rec:
+                                i += 1
+                            rec[f"{name}_{i}"] = display
+                        else:
+                            rec[name] = display
+                    continue  # TransData обработана, дальше не идём
+
+                # обычный дочерний узел — сначала текст, потом атрибуты
                 text = (child.text or "").strip()
                 if text:
                     key = tag_local
@@ -355,7 +394,6 @@ def extract_records(path, record_tag, namespace=None,
                     else:
                         rec[key] = text
 
-                # атрибуты узла -> "Тег.@атрибут"
                 for ak, av in child.attrib.items():
                     key = f"{tag_local}.@{strip_ns(ak)}"
                     if key in rec:
@@ -415,37 +453,22 @@ def dump_first_record(xml_path, record_tag="Trans", namespace=None,
 
 
 # ============================================================
-# 4. КОЛОНКИ
+# 4. КОЛОНКИ — строго по XML
 # ============================================================
 
 def build_columns(records, descriptions=None):
+    """
+    Порядок ключей — как в первой записи (то есть как в XML).
+    Если в других записях встречаются новые ключи — они идут в конец
+    в порядке появления.
+    """
     seen = {}
     for rec in records:
         for k in rec:
-            seen[k] = True
+            if k not in seen:
+                seen[k] = True
 
-    all_keys = list(seen.keys())
-
-    preferred = []
-    others = []
-    used = set()
-
-    for pref in QUIK_PREFERRED_ORDER:
-        for k in all_keys:
-            if k in used:
-                continue
-            if k == pref:
-                preferred.append(k)
-                used.add(k)
-            elif base_field_name(k) == base_field_name(pref):
-                preferred.append(k)
-                used.add(k)
-
-    for k in all_keys:
-        if k not in used:
-            others.append(k)
-
-    columns = preferred + others
+    columns = list(seen.keys())
     header_map = {c: label_for(c, descriptions) for c in columns}
     return columns, header_map
 
@@ -502,13 +525,23 @@ def export_docx(xml_path, out_path, record_tag, namespace=None,
                 config=None, limit=100000, progress_cb=None,
                 cancel_flag=None, as_cards=False):
     doc = Document()
+
+    header = read_report_header(xml_path)
+
     title = doc.add_heading("Отчёт по транзакциям QUIK", level=0)
     title.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
     meta = doc.add_paragraph()
     meta.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    r = meta.add_run(f"Источник: {os.path.basename(xml_path)}")
-    r.italic = True
+    meta.add_run("Дата формирования отчёта: "
+                 f"{datetime.now().strftime('%d.%m.%Y %H:%M')}\n").italic = True
+    if header.get("StartDate") or header.get("EndDate"):
+        s = format_date_string(header.get("StartDate", ""))
+        e = format_date_string(header.get("EndDate", ""))
+        meta.add_run(f"Период: {s} — {e}\n").italic = True
+    if header.get("ProgramVersion"):
+        meta.add_run(f"Версия QUIK: {header['ProgramVersion']}\n").italic = True
+    meta.add_run(f"Источник: {os.path.basename(xml_path)}").italic = True
 
     descriptions = {}
     records = list(extract_records(
@@ -544,6 +577,7 @@ HTML_HEAD = """<!DOCTYPE html>
   body {{ font-family: -apple-system, Segoe UI, Arial, sans-serif;
          margin: 2em; color: #222; }}
   h1 {{ border-bottom: 2px solid #444; padding-bottom: .3em; }}
+  .meta {{ color: #555; font-size: 13px; margin-bottom: 1em; }}
   table {{ border-collapse: collapse; margin: 1em 0; width: 100%;
            font-size: 13px; }}
   th, td {{ border: 1px solid #ccc; padding: 6px 10px; text-align: left;
@@ -558,7 +592,7 @@ HTML_HEAD = """<!DOCTYPE html>
   .field b {{ color: #333; }}
 </style></head><body>
 <h1>{title}</h1>
-<p><i>Источник: {source}<br>Записей: {count}</i></p>
+<div class="meta">{meta}</div>
 """
 
 
@@ -569,6 +603,8 @@ def _esc(s):
 def export_html(xml_path, out_path, record_tag, namespace=None,
                 config=None, limit=100000, progress_cb=None,
                 cancel_flag=None, as_cards=False):
+    header = read_report_header(xml_path)
+
     descriptions = {}
     records = list(extract_records(
         xml_path, record_tag, namespace,
@@ -578,11 +614,22 @@ def export_html(xml_path, out_path, record_tag, namespace=None,
 
     columns, header_map = build_columns(records, descriptions)
 
+    meta_lines = [
+        f"Дата формирования: {datetime.now().strftime('%d.%m.%Y %H:%M')}",
+    ]
+    if header.get("StartDate") or header.get("EndDate"):
+        s = format_date_string(header.get("StartDate", ""))
+        e = format_date_string(header.get("EndDate", ""))
+        meta_lines.append(f"Период: {s} — {e}")
+    if header.get("ProgramVersion"):
+        meta_lines.append(f"Версия QUIK: {header['ProgramVersion']}")
+    meta_lines.append(f"Источник: {os.path.basename(xml_path)}")
+    meta_lines.append(f"Записей: {len(records)}")
+
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(HTML_HEAD.format(
             title="Отчёт по транзакциям QUIK",
-            source=_esc(os.path.basename(xml_path)),
-            count=len(records),
+            meta="<br>".join(_esc(m) for m in meta_lines),
         ))
 
         if as_cards:
@@ -647,6 +694,8 @@ def export_pdf(xml_path, out_path, record_tag, namespace=None,
     small = ParagraphStyle("S", parent=styles["Normal"], fontName=font,
                            fontSize=8, leading=10, textColor=colors.grey)
 
+    header = read_report_header(xml_path)
+
     descriptions = {}
     records = list(extract_records(
         xml_path, record_tag, namespace,
@@ -667,9 +716,21 @@ def export_pdf(xml_path, out_path, record_tag, namespace=None,
 
     story = []
     story.append(Paragraph("Отчёт по транзакциям QUIK", h1))
-    story.append(Paragraph(
-        f"Источник: {_esc(os.path.basename(xml_path))} &nbsp;|&nbsp; "
-        f"Записей: {len(records)}", small))
+
+    meta_lines = [
+        f"Дата формирования: {datetime.now().strftime('%d.%m.%Y %H:%M')}",
+    ]
+    if header.get("StartDate") or header.get("EndDate"):
+        s = format_date_string(header.get("StartDate", ""))
+        e = format_date_string(header.get("EndDate", ""))
+        meta_lines.append(f"Период: {s} — {e}")
+    if header.get("ProgramVersion"):
+        meta_lines.append(f"Версия QUIK: {header['ProgramVersion']}")
+    meta_lines.append(f"Источник: {os.path.basename(xml_path)}")
+    meta_lines.append(f"Записей: {len(records)}")
+
+    for line in meta_lines:
+        story.append(Paragraph(_esc(line), small))
     story.append(Spacer(1, 8))
 
     if as_cards:
@@ -762,7 +823,6 @@ class App(tk.Tk):
     def _build_ui(self):
         pad = {"padx": 10, "pady": 6}
 
-        # 1. Файл
         frame_file = ttk.LabelFrame(self, text="1. XML-файл QUIK")
         frame_file.pack(fill="x", **pad)
         ttk.Entry(frame_file, textvariable=self.xml_path, width=70).pack(
@@ -770,7 +830,6 @@ class App(tk.Tk):
         ttk.Button(frame_file, text="Обзор…", command=self.choose_file).pack(
             side="right", padx=6, pady=6)
 
-        # 2. Диагностика
         frame_an = ttk.LabelFrame(self, text="2. Диагностика")
         frame_an.pack(fill="x", **pad)
         ttk.Button(frame_an, text="Анализ структуры",
@@ -779,7 +838,6 @@ class App(tk.Tk):
         ttk.Button(frame_an, text="Сырой дамп первой записи",
                    command=self.show_dump).pack(side="left", padx=6, pady=6)
 
-        # 3. Тег записи
         frame_rec = ttk.LabelFrame(
             self, text="3. Тег записи (по умолчанию Trans)")
         frame_rec.pack(fill="x", **pad)
@@ -790,7 +848,6 @@ class App(tk.Tk):
         ttk.Entry(frame_rec, textvariable=self.limit, width=10).pack(
             side="left", padx=6)
 
-        # 4. Параметры Field (атрибуты)
         frame_fields = ttk.LabelFrame(
             self, text="4. Параметры TransData / Field (атрибуты)")
         frame_fields.pack(fill="x", **pad)
@@ -823,7 +880,6 @@ class App(tk.Tk):
         ttk.Entry(r3, textvariable=self.prepared_attr, width=16).pack(
             side="left", padx=4)
 
-        # 5. Представление
         frame_view = ttk.LabelFrame(self, text="5. Представление")
         frame_view.pack(fill="x", **pad)
         ttk.Radiobutton(frame_view, text="Таблица",
@@ -833,7 +889,6 @@ class App(tk.Tk):
                         value="cards", variable=self.view_mode).pack(
             side="left", padx=12, pady=6)
 
-        # 6. Формат
         frame_fmt = ttk.LabelFrame(self, text="6. Формат вывода")
         frame_fmt.pack(fill="x", **pad)
         for fmt, label in [("html", "HTML"), ("docx", "Word (.docx)"),
@@ -842,13 +897,11 @@ class App(tk.Tk):
                             variable=self.format_var).pack(
                 side="left", padx=12, pady=6)
 
-        # Прогресс
         frame_prog = ttk.LabelFrame(self, text="Прогресс")
         frame_prog.pack(fill="x", **pad)
         self.progress = ttk.Progressbar(frame_prog, mode="indeterminate")
         self.progress.pack(fill="x", padx=6, pady=8)
 
-        # Кнопки
         frame_btn = ttk.Frame(self)
         frame_btn.pack(fill="x", **pad)
         self.btn_convert = ttk.Button(frame_btn, text="Сформировать отчёт",
@@ -860,8 +913,6 @@ class App(tk.Tk):
 
         self.status = ttk.Label(self, text="Готов к работе", foreground="gray")
         self.status.pack(pady=4)
-
-    # ---------- действия ----------
 
     def choose_file(self):
         path = filedialog.askopenfilename(
