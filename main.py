@@ -23,23 +23,15 @@ from reportlab.pdfbase.ttfonts import TTFont
 # 0. КОНСТАНТЫ
 # ============================================================
 
-QUIK_NS = "urn:quik:trans-info:v1.0"
-
 RECORD_TAG = "Trans"
 CONTAINER_TAG = "TransData"
 FIELD_TAG = "Field"
 NAME_ATTR = "Name"
 DESC_ATTR = "Description"
-VALUE_ATTR = "Value"
 PREPARED_ATTR = "PreparedValue"
 
 DEFAULT_LIMIT = 1000000
-
-# Порог: 1.0 — оставить поля, которые присутствуют в КАЖДОЙ записи
-# (пустые значения не отбрасывают колонку).
 MIN_FILL_RATIO = 1.0
-
-# Символ для пустых значений
 EMPTY_MARK = "—"
 
 QUIK_FIELD_LABELS = {
@@ -117,13 +109,8 @@ def label_for(field_name, descriptions=None):
 
 
 def format_quik_value(col, value):
-    """
-    Показывает PreparedValue как есть.
-    Даты приводятся к DD.MM.YYYY.
-    Пустое значение отображается как "—".
-    """
+    """Показывает PreparedValue как есть; пустое -> «—»."""
     base = base_field_name(col)
-
     if value is None:
         return EMPTY_MARK
     s = str(value).strip()
@@ -178,6 +165,10 @@ def format_date_string(s):
     return s
 
 
+def _is_empty(value):
+    return value is None or str(value).strip() == ""
+
+
 # ============================================================
 # 2. ИЗВЛЕЧЕНИЕ ЗАПИСЕЙ
 # ============================================================
@@ -185,6 +176,12 @@ def format_date_string(s):
 def extract_records(path, record_tag=RECORD_TAG, namespace=None,
                     descriptions=None,
                     progress_cb=None, cancel_flag=None, max_records=None):
+    """
+    Порядок ключей — строго как в XML.
+    Значения из TransData/Field берутся ТОЛЬКО из PreparedValue.
+    Пустые дочерние узлы Trans (например, PureData) тоже попадают в rec,
+    чтобы в отчёте отобразиться как «—».
+    """
     if descriptions is None:
         descriptions = {}
 
@@ -245,17 +242,17 @@ def extract_records(path, record_tag=RECORD_TAG, namespace=None,
                             rec[name] = display
                     continue
 
-                # обычный дочерний узел — текст, потом атрибуты
+                # 3. Обычный дочерний узел — сначала текст, потом атрибуты.
+                #    Даже если текста нет — добавляем ключ (будет «—»).
                 text = (child.text or "").strip()
-                if text:
-                    key = tag_local
-                    if key in rec:
-                        i = 2
-                        while f"{key}_{i}" in rec:
-                            i += 1
-                        rec[f"{key}_{i}"] = text
-                    else:
-                        rec[key] = text
+
+                if tag_local not in rec:
+                    rec[tag_local] = text
+                else:
+                    i = 2
+                    while f"{tag_local}_{i}" in rec:
+                        i += 1
+                    rec[f"{tag_local}_{i}"] = text
 
                 for ak, av in child.attrib.items():
                     key = f"{tag_local}.@{strip_ns(ak)}"
@@ -281,14 +278,13 @@ def extract_records(path, record_tag=RECORD_TAG, namespace=None,
 
 
 # ============================================================
-# 3. КОЛОНКИ — по наличию ключа (пустые значения не отбрасывают)
+# 3. КОЛОНКИ
 # ============================================================
 
 def build_columns(records, descriptions=None, min_fill_ratio=MIN_FILL_RATIO):
     """
-    Возвращает (columns, header_map).
-    min_fill_ratio = 1.0 — оставляем поля, которые присутствуют
-    в КАЖДОЙ записи, независимо от того, пустое у них значение или нет.
+    Оставляем колонки, которые присутствуют в КАЖДОЙ записи
+    (наличие ключа, а не непустое значение).
     """
     if not records:
         return [], {}
@@ -347,10 +343,6 @@ HTML_HEAD = """<!DOCTYPE html>
 
 def _esc(s):
     return html.escape(str(s))
-
-
-def _is_empty(value):
-    return value is None or str(value).strip() == ""
 
 
 def export_html(xml_path, out_path, namespace=None,
@@ -550,7 +542,7 @@ class App(tk.Tk):
 
         self.xml_path = tk.StringVar()
         self.format_var = tk.StringVar(value="html")
-        self.view_mode = tk.StringVar(value="cards")  # Карточки по умолчанию
+        self.view_mode = tk.StringVar(value="cards")
 
         self.cancel_flag = threading.Event()
 
