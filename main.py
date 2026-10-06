@@ -117,11 +117,13 @@ def format_quik_value(col, value):
     if not s:
         return EMPTY_MARK
 
+    # YYYY-MM-DD -> DD.MM.YYYY
     if len(s) == 10 and s[4] == "-" and s[7] == "-":
         y, m, d = s.split("-")
         if y.isdigit() and m.isdigit() and d.isdigit():
             return f"{d}.{m}.{y}"
 
+    # YYYYMMDD -> DD.MM.YYYY
     if base in ("TradeDate", "QuikDate", "Date", "SettleDate") \
             and len(s) == 8 and s.isdigit():
         return f"{s[6:8]}.{s[4:6]}.{s[0:4]}"
@@ -175,8 +177,9 @@ def extract_records(path, record_tag=RECORD_TAG, namespace=None,
                     descriptions=None,
                     progress_cb=None, cancel_flag=None, max_records=None):
     """
-    Поиск TransData и Field идёт через XPath с local-name(),
-    поэтому namespace XML (или его отсутствие) не влияет.
+    Извлекает записи <Trans>.
+    TransData и Field ищутся через XPath с local-name(),
+    на любой глубине внутри Trans — независимо от namespace.
     """
     if descriptions is None:
         descriptions = {}
@@ -197,47 +200,50 @@ def extract_records(path, record_tag=RECORD_TAG, namespace=None,
             for k, v in elem.attrib.items():
                 rec[f"@{strip_ns(k)}"] = v
 
-            # 2. Дочерние узлы Trans в порядке XML
+            # 2. TransData -> Field (на любой глубине)
+            containers = elem.xpath(".//*[local-name()='TransData']")
+
+            for container in containers:
+                fields = container.xpath(".//*[local-name()='Field']")
+
+                def _num_key(fe):
+                    try:
+                        return int(fe.get("Number") or 0)
+                    except ValueError:
+                        return 0
+                fields.sort(key=_num_key)
+
+                for field in fields:
+                    name = (field.get(NAME_ATTR) or "").strip()
+                    desc = (field.get(DESC_ATTR) or "").strip()
+                    prepared = (field.get(PREPARED_ATTR) or "").strip()
+
+                    if not name:
+                        continue
+
+                    if desc and name not in descriptions:
+                        descriptions[name] = desc
+
+                    display = prepared
+
+                    if name in rec:
+                        i = 2
+                        while f"{name}_{i}" in rec:
+                            i += 1
+                        rec[f"{name}_{i}"] = display
+                    else:
+                        rec[name] = display
+
+            # 3. Остальные дочерние узлы Trans (кроме TransData)
             for child in elem:
                 if not isinstance(child.tag, str):
                     continue
                 tag_local = strip_ns(child.tag)
 
-                # ---- TransData / Field ----
                 if tag_local == CONTAINER_TAG:
-                    # Ищем Field независимо от namespace
-                    fields = child.xpath("./*[local-name()='Field']")
-
-                    def _num_key(fe):
-                        try:
-                            return int(fe.get("Number") or 0)
-                        except ValueError:
-                            return 0
-                    fields.sort(key=_num_key)
-
-                    for field in fields:
-                        name = (field.get(NAME_ATTR) or "").strip()
-                        desc = (field.get(DESC_ATTR) or "").strip()
-                        prepared = (field.get(PREPARED_ATTR) or "").strip()
-
-                        if not name:
-                            continue
-
-                        if desc and name not in descriptions:
-                            descriptions[name] = desc
-
-                        display = prepared
-
-                        if name in rec:
-                            i = 2
-                            while f"{name}_{i}" in rec:
-                                i += 1
-                            rec[f"{name}_{i}"] = display
-                        else:
-                            rec[name] = display
                     continue
 
-                # ---- Обычный дочерний узел ----
+                # обычный узел — текст, потом атрибуты
                 text = (child.text or "").strip()
                 if tag_local not in rec:
                     rec[tag_local] = text
@@ -275,9 +281,7 @@ def extract_records(path, record_tag=RECORD_TAG, namespace=None,
 # ============================================================
 
 def build_columns(records, descriptions=None, min_fill_ratio=MIN_FILL_RATIO):
-    """
-    Порог по наличию ключа (не по непустому значению).
-    """
+    """Порог по наличию ключа (не по непустому значению)."""
     if not records:
         return [], {}
 
@@ -543,6 +547,7 @@ class App(tk.Tk):
     def _build_ui(self):
         pad = {"padx": 10, "pady": 8}
 
+        # 1. Файл
         frame_file = ttk.LabelFrame(self, text="1. XML-файл QUIK")
         frame_file.pack(fill="x", **pad)
         ttk.Entry(frame_file, textvariable=self.xml_path, width=70).pack(
@@ -550,6 +555,7 @@ class App(tk.Tk):
         ttk.Button(frame_file, text="Обзор…", command=self.choose_file).pack(
             side="right", padx=6, pady=6)
 
+        # 2. Представление (Карточки по умолчанию)
         frame_view = ttk.LabelFrame(self, text="2. Представление")
         frame_view.pack(fill="x", **pad)
         ttk.Radiobutton(frame_view, text="Карточки",
@@ -559,6 +565,7 @@ class App(tk.Tk):
                         value="table", variable=self.view_mode).pack(
             side="left", padx=16, pady=8)
 
+        # 3. Формат вывода
         frame_fmt = ttk.LabelFrame(self, text="3. Формат вывода")
         frame_fmt.pack(fill="x", **pad)
         for fmt, label in [("html", "HTML"), ("pdf", "PDF")]:
@@ -566,11 +573,13 @@ class App(tk.Tk):
                             variable=self.format_var).pack(
                 side="left", padx=16, pady=8)
 
+        # Прогресс
         frame_prog = ttk.LabelFrame(self, text="Прогресс")
         frame_prog.pack(fill="x", **pad)
         self.progress = ttk.Progressbar(frame_prog, mode="indeterminate")
         self.progress.pack(fill="x", padx=6, pady=8)
 
+        # Кнопки
         frame_btn = ttk.Frame(self)
         frame_btn.pack(fill="x", **pad)
         self.btn_convert = ttk.Button(frame_btn, text="Сформировать отчёт",
