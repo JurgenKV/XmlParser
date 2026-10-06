@@ -19,7 +19,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 
 
 # ============================================================
-# 0. КОНСТАНТЫ (раньше были настраиваемыми в UI)
+# 0. КОНСТАНТЫ
 # ============================================================
 
 QUIK_NS = "urn:quik:trans-info:v1.0"
@@ -32,6 +32,8 @@ DESC_ATTR = "Description"
 VALUE_ATTR = "Value"
 PREPARED_ATTR = "PreparedValue"
 DEFAULT_LIMIT = 1000000
+
+EMPTY_MARK = "-"
 
 QUIK_FIELD_LABELS = {
     "@TransNum":   "№ транзакции",
@@ -108,13 +110,13 @@ def label_for(field_name, descriptions=None):
 
 
 def format_quik_value(col, value):
-    """Форматирование PreparedValue для вывода."""
+    """Форматирование PreparedValue. Пустое -> «-»."""
     base = base_field_name(col)
     if value is None:
-        return ""
+        return EMPTY_MARK
     s = str(value).strip()
     if not s:
-        return ""
+        return EMPTY_MARK
 
     # YYYY-MM-DD -> DD.MM.YYYY
     if len(s) == 10 and s[4] == "-" and s[7] == "-":
@@ -180,7 +182,7 @@ def format_date_string(s):
 
 
 # ============================================================
-# 2. КОНФИГ ИЗВЛЕЧЕНИЯ (параметры зашиты)
+# 2. КОНФИГ ИЗВЛЕЧЕНИЯ
 # ============================================================
 
 class ExtractConfig:
@@ -261,8 +263,7 @@ def extract_records(path, record_tag=RECORD_TAG, namespace=None,
                         if desc and name not in descriptions:
                             descriptions[name] = desc
 
-                        # ТОЛЬКО PreparedValue
-                        display = prepared
+                        display = prepared  # ТОЛЬКО PreparedValue
 
                         if name in rec:
                             i = 2
@@ -312,17 +313,34 @@ def extract_records(path, record_tag=RECORD_TAG, namespace=None,
 # 4. КОЛОНКИ
 # ============================================================
 
-def build_columns(records, descriptions=None):
-    """Порядок колонок — как в первой записи (то есть как в XML)."""
+def build_card_columns(records, descriptions=None):
+    """
+    Набор колонок для КАРТОЧЕК — все ключи, встречающиеся хотя бы в одной
+    записи (в порядке первого появления). Карточка отфильтрует лишние
+    сама — покажет только те поля, которые есть в конкретной записи.
+    """
     seen = {}
     for rec in records:
         for k in rec:
             if k not in seen:
                 seen[k] = True
-
     columns = list(seen.keys())
     header_map = {c: label_for(c, descriptions) for c in columns}
     return columns, header_map
+
+
+def build_table_columns(records):
+    """
+    Колонки для ТАБЛИЦЫ — только те ключи, которые есть в КАЖДОЙ записи.
+    Порядок — как в первой записи. Никаких «разреженных» столбцов:
+    таблица содержит ровно те же поля, что видны в карточках.
+    """
+    if not records:
+        return []
+    common = set(records[0].keys())
+    for rec in records[1:]:
+        common &= set(rec.keys())
+    return [k for k in records[0] if k in common]
 
 
 # ============================================================
@@ -371,7 +389,10 @@ def export_html(xml_path, out_path, record_tag=RECORD_TAG, namespace=None,
         progress_cb=progress_cb, cancel_flag=cancel_flag,
         max_records=limit))
 
-    columns, header_map = build_columns(records, descriptions)
+    # Для карточек — набор всех полей; для таблицы — только общие поля
+    card_columns, card_header_map = build_card_columns(records, descriptions)
+    table_columns = build_table_columns(records)
+    table_header_map = {c: label_for(c, descriptions) for c in table_columns}
 
     meta_lines = [
         f"Дата формирования: {datetime.now().strftime('%d.%m.%Y %H:%M')}",
@@ -394,20 +415,21 @@ def export_html(xml_path, out_path, record_tag=RECORD_TAG, namespace=None,
         if as_cards:
             for i, rec in enumerate(records, 1):
                 f.write(f'<div class="card"><h3>Запись {i}</h3>\n')
-                for col in columns:
-                    if col in rec:
-                        f.write(
-                            f'<div class="field"><b>{_esc(header_map[col])}:</b> '
-                            f'{_esc(format_quik_value(col, rec[col]))}</div>\n')
+                for col in card_columns:
+                    if col not in rec:
+                        continue
+                    f.write(
+                        f'<div class="field"><b>{_esc(card_header_map[col])}:</b> '
+                        f'{_esc(format_quik_value(col, rec[col]))}</div>\n')
                 f.write("</div>\n")
         else:
             f.write("<table><thead><tr>")
-            for col in columns:
-                f.write(f"<th>{_esc(header_map[col])}</th>")
+            for col in table_columns:
+                f.write(f"<th>{_esc(table_header_map[col])}</th>")
             f.write("</tr></thead><tbody>\n")
             for rec in records:
                 f.write("<tr>")
-                for col in columns:
+                for col in table_columns:
                     cls = ("num"
                            if base_field_name(col) in QUIK_NUMERIC_FIELDS
                            else "")
@@ -462,9 +484,11 @@ def export_pdf(xml_path, out_path, record_tag=RECORD_TAG, namespace=None,
         progress_cb=progress_cb, cancel_flag=cancel_flag,
         max_records=limit))
 
-    columns, header_map = build_columns(records, descriptions)
+    card_columns, card_header_map = build_card_columns(records, descriptions)
+    table_columns = build_table_columns(records)
+    table_header_map = {c: label_for(c, descriptions) for c in table_columns}
 
-    use_landscape = len(columns) > 5
+    use_landscape = len(table_columns) > 5 if not as_cards else False
     pagesize = landscape(A4) if use_landscape else A4
 
     doc = SimpleDocTemplate(
@@ -495,23 +519,24 @@ def export_pdf(xml_path, out_path, record_tag=RECORD_TAG, namespace=None,
     if as_cards:
         for i, rec in enumerate(records, 1):
             story.append(Paragraph(f"<b>Запись {i}</b>", normal))
-            for col in columns:
-                if col in rec:
-                    story.append(Paragraph(
-                        f"<b>{_esc(header_map[col])}:</b> "
-                        f"{_esc(format_quik_value(col, rec[col]))}", normal))
+            for col in card_columns:
+                if col not in rec:
+                    continue
+                story.append(Paragraph(
+                    f"<b>{_esc(card_header_map[col])}:</b> "
+                    f"{_esc(format_quik_value(col, rec[col]))}", normal))
             story.append(Spacer(1, 6))
     else:
-        data = [[Paragraph(f"<b>{_esc(header_map[c])}</b>", normal)
-                 for c in columns]]
+        data = [[Paragraph(f"<b>{_esc(table_header_map[c])}</b>", normal)
+                 for c in table_columns]]
         for rec in records:
             data.append([
                 Paragraph(_esc(format_quik_value(c, rec.get(c, ""))), normal)
-                for c in columns
+                for c in table_columns
             ])
 
-        avail = (pagesize[0] - 2.4 * cm) / max(len(columns), 1)
-        col_widths = [avail] * len(columns)
+        avail = (pagesize[0] - 2.4 * cm) / max(len(table_columns), 1)
+        col_widths = [avail] * len(table_columns)
 
         tbl = Table(data, colWidths=col_widths, repeatRows=1)
         tbl.setStyle(TableStyle([
@@ -541,7 +566,7 @@ class App(tk.Tk):
 
         self.xml_path = tk.StringVar()
         self.format_var = tk.StringVar(value="html")
-        self.view_mode = tk.StringVar(value="cards")  # Карточки по умолчанию
+        self.view_mode = tk.StringVar(value="cards")
 
         self.cancel_flag = threading.Event()
 
@@ -558,7 +583,7 @@ class App(tk.Tk):
         ttk.Button(frame_file, text="Обзор…", command=self.choose_file).pack(
             side="right", padx=6, pady=6)
 
-        # 2. Представление (Карточки первыми, по умолчанию выбраны)
+        # 2. Представление
         frame_view = ttk.LabelFrame(self, text="2. Представление")
         frame_view.pack(fill="x", **pad)
         ttk.Radiobutton(frame_view, text="Карточки",
