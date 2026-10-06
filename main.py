@@ -4,7 +4,7 @@ import threading
 from datetime import datetime
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
-from collections import Counter, defaultdict
+from collections import defaultdict
 
 from lxml import etree as ET
 
@@ -117,13 +117,11 @@ def format_quik_value(col, value):
     if not s:
         return EMPTY_MARK
 
-    # YYYY-MM-DD -> DD.MM.YYYY
     if len(s) == 10 and s[4] == "-" and s[7] == "-":
         y, m, d = s.split("-")
         if y.isdigit() and m.isdigit() and d.isdigit():
             return f"{d}.{m}.{y}"
 
-    # YYYYMMDD -> DD.MM.YYYY
     if base in ("TradeDate", "QuikDate", "Date", "SettleDate") \
             and len(s) == 8 and s.isdigit():
         return f"{s[6:8]}.{s[4:6]}.{s[0:4]}"
@@ -177,10 +175,8 @@ def extract_records(path, record_tag=RECORD_TAG, namespace=None,
                     descriptions=None,
                     progress_cb=None, cancel_flag=None, max_records=None):
     """
-    Порядок ключей — строго как в XML.
-    Значения из TransData/Field берутся ТОЛЬКО из PreparedValue.
-    Пустые дочерние узлы Trans (например, PureData) тоже попадают в rec,
-    чтобы в отчёте отобразиться как «—».
+    Поиск TransData и Field идёт через XPath с local-name(),
+    поэтому namespace XML (или его отсутствие) не влияет.
     """
     if descriptions is None:
         descriptions = {}
@@ -207,11 +203,10 @@ def extract_records(path, record_tag=RECORD_TAG, namespace=None,
                     continue
                 tag_local = strip_ns(child.tag)
 
+                # ---- TransData / Field ----
                 if tag_local == CONTAINER_TAG:
-                    fields = list(child.findall(FIELD_TAG))
-                    if namespace and not fields:
-                        fields = list(child.findall(
-                            f"{{{namespace}}}{FIELD_TAG}"))
+                    # Ищем Field независимо от namespace
+                    fields = child.xpath("./*[local-name()='Field']")
 
                     def _num_key(fe):
                         try:
@@ -242,10 +237,8 @@ def extract_records(path, record_tag=RECORD_TAG, namespace=None,
                             rec[name] = display
                     continue
 
-                # 3. Обычный дочерний узел — сначала текст, потом атрибуты.
-                #    Даже если текста нет — добавляем ключ (будет «—»).
+                # ---- Обычный дочерний узел ----
                 text = (child.text or "").strip()
-
                 if tag_local not in rec:
                     rec[tag_local] = text
                 else:
@@ -283,8 +276,7 @@ def extract_records(path, record_tag=RECORD_TAG, namespace=None,
 
 def build_columns(records, descriptions=None, min_fill_ratio=MIN_FILL_RATIO):
     """
-    Оставляем колонки, которые присутствуют в КАЖДОЙ записи
-    (наличие ключа, а не непустое значение).
+    Порог по наличию ключа (не по непустому значению).
     """
     if not records:
         return [], {}
