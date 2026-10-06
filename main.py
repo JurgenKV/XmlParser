@@ -3,7 +3,9 @@ import html
 import threading
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
-import xml.etree.ElementTree as ET
+
+# --- Парсинг XML (lxml — умеет getprevious/getparent, быстрее и экономнее по памяти) ---
+from lxml import etree as ET
 
 # --- DOCX ---
 from docx import Document
@@ -21,12 +23,13 @@ from reportlab.lib.enums import TA_LEFT
 
 
 # ============================================================
-# 1. ПОТОКОВЫЙ ПАРСИНГ XML
+# 1. ПОТОКОВЫЙ ПАРСИНГ XML (lxml)
 # ============================================================
 
 def iter_xml_nodes(path, progress_cb=None):
     """
-    Потоковый обход XML. Возвращает (level, tag, attrib, text) для каждого узла.
+    Потоковый обход XML через lxml.iterparse.
+    Возвращает (level, tag, attrib, text) для каждого узла.
     Память: O(глубина дерева), а не O(размер файла).
     """
     context = ET.iterparse(path, events=("start", "end"))
@@ -41,9 +44,11 @@ def iter_xml_nodes(path, progress_cb=None):
             level -= 1
 
             text = (elem.text or "").strip()
-            yield (level, elem.tag, dict(elem.attrib), text)
+            # elem.tag у lxml может быть bytes/str или функцией (comments/PI) — приводим к str
+            tag = elem.tag if isinstance(elem.tag, str) else str(elem.tag)
+            yield (level, tag, dict(elem.attrib), text)
 
-            # Освобождаем память
+            # Освобождение памяти: чистим узел и удаляем его из родителя
             elem.clear()
             while elem.getprevious() is not None:
                 del elem.getparent()[0]
@@ -58,7 +63,8 @@ def iter_xml_nodes(path, progress_cb=None):
 def xml_root_tag(path):
     """Быстро достаёт имя корневого тега."""
     for event, elem in ET.iterparse(path, events=("start",)):
-        return elem.tag
+        tag = elem.tag if isinstance(elem.tag, str) else str(elem.tag)
+        return tag
     return "root"
 
 
@@ -70,7 +76,6 @@ def export_html(xml_path, out_path, progress_cb=None):
     root_tag = xml_root_tag(xml_path)
 
     with open(out_path, "w", encoding="utf-8") as f:
-        # Шапка HTML
         f.write("<!DOCTYPE html>\n<html lang='ru'>\n<head>\n")
         f.write("<meta charset='utf-8'>\n")
         f.write(f"<title>XML: {html.escape(root_tag)}</title>\n")
@@ -258,7 +263,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("XML → DOCX / PDF / HTML")
-        self.geometry("620x420")
+        self.geometry("640x430")
         self.resizable(False, False)
 
         self.xml_path = tk.StringVar()
@@ -417,7 +422,7 @@ class App(tk.Tk):
                 msg = "Готово:\n" + "\n".join(result)
                 self.after(0, self._show_success, msg)
 
-            except ET.ParseError as exc:
+            except ET.XMLSyntaxError as exc:
                 err_text = f"Не удалось разобрать XML:\n{exc}"
                 self.after(0, self._show_error, "Ошибка XML", err_text)
 
