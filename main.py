@@ -25,7 +25,6 @@ from reportlab.pdfbase.ttfonts import TTFont
 
 QUIK_NS = "urn:quik:trans-info:v1.0"
 
-# Зашитые параметры (раньше были в UI)
 RECORD_TAG = "Trans"
 CONTAINER_TAG = "TransData"
 FIELD_TAG = "Field"
@@ -36,9 +35,12 @@ PREPARED_ATTR = "PreparedValue"
 
 DEFAULT_LIMIT = 1000000
 
-# Минимальная доля записей, в которых поле должно быть непустым,
-# чтобы попасть в таблицу. 1.0 — во всех записях (как карточки).
+# Порог: 1.0 — оставить поля, которые присутствуют в КАЖДОЙ записи
+# (пустые значения не отбрасывают колонку).
 MIN_FILL_RATIO = 1.0
+
+# Символ для пустых значений
+EMPTY_MARK = "—"
 
 QUIK_FIELD_LABELS = {
     "@TransNum":   "№ транзакции",
@@ -117,15 +119,16 @@ def label_for(field_name, descriptions=None):
 def format_quik_value(col, value):
     """
     Показывает PreparedValue как есть.
-    Только даты приводятся к DD.MM.YYYY.
-    Числа не нормализуются: "1000,0" остаётся "1000,0".
+    Даты приводятся к DD.MM.YYYY.
+    Пустое значение отображается как "—".
     """
     base = base_field_name(col)
+
     if value is None:
-        return ""
+        return EMPTY_MARK
     s = str(value).strip()
     if not s:
-        return ""
+        return EMPTY_MARK
 
     # YYYY-MM-DD -> DD.MM.YYYY
     if len(s) == 10 and s[4] == "-" and s[7] == "-":
@@ -152,7 +155,6 @@ def detect_namespace(path):
 
 
 def read_report_header(path):
-    """Читает атрибуты корневого узла TransactionsReport."""
     info = {"ProgramVersion": "", "StartDate": "", "EndDate": ""}
     with open(path, "rb") as f:
         for _, elem in ET.iterparse(f, events=("start",)):
@@ -183,10 +185,6 @@ def format_date_string(s):
 def extract_records(path, record_tag=RECORD_TAG, namespace=None,
                     descriptions=None,
                     progress_cb=None, cancel_flag=None, max_records=None):
-    """
-    Порядок ключей — строго как в XML.
-    Значения из TransData/Field берутся ТОЛЬКО из PreparedValue.
-    """
     if descriptions is None:
         descriptions = {}
 
@@ -283,14 +281,14 @@ def extract_records(path, record_tag=RECORD_TAG, namespace=None,
 
 
 # ============================================================
-# 3. КОЛОНКИ — как в карточках (без «разреженных» столбцов)
+# 3. КОЛОНКИ — по наличию ключа (пустые значения не отбрасывают)
 # ============================================================
 
 def build_columns(records, descriptions=None, min_fill_ratio=MIN_FILL_RATIO):
     """
     Возвращает (columns, header_map).
-    min_fill_ratio = 1.0 — оставляем только поля, заполненные во ВСЕХ записях.
-    Это эквивалент карточек: пустых столбцов в таблице не будет.
+    min_fill_ratio = 1.0 — оставляем поля, которые присутствуют
+    в КАЖДОЙ записи, независимо от того, пустое у них значение или нет.
     """
     if not records:
         return [], {}
@@ -300,11 +298,10 @@ def build_columns(records, descriptions=None, min_fill_ratio=MIN_FILL_RATIO):
     order = {}
 
     for rec in records:
-        for k, v in rec.items():
+        for k in rec:
             if k not in order:
                 order[k] = len(order)
-            if v not in (None, ""):
-                counts[k] += 1
+            counts[k] += 1
 
     ordered_keys = sorted(order, key=order.get)
     columns = [
@@ -335,11 +332,13 @@ HTML_HEAD = """<!DOCTYPE html>
   th {{ background: #f0f4f8; position: sticky; top: 0; }}
   tr:nth-child(even) {{ background: #fafbfc; }}
   td.num {{ text-align: right; font-variant-numeric: tabular-nums; }}
+  td.empty {{ color: #999; }}
   .card {{ border: 1px solid #ddd; border-radius: 6px; padding: 12px 16px;
            margin: 8px 0; background: #fafbfc; }}
   .card h3 {{ margin-top: 0; color: #004a99; }}
   .field {{ margin: 2px 0; }}
   .field b {{ color: #333; }}
+  .field .empty {{ color: #999; }}
 </style></head><body>
 <h1>{title}</h1>
 <div class="meta">{meta}</div>
@@ -348,6 +347,10 @@ HTML_HEAD = """<!DOCTYPE html>
 
 def _esc(s):
     return html.escape(str(s))
+
+
+def _is_empty(value):
+    return value is None or str(value).strip() == ""
 
 
 def export_html(xml_path, out_path, namespace=None,
@@ -386,11 +389,12 @@ def export_html(xml_path, out_path, namespace=None,
             for i, rec in enumerate(records, 1):
                 f.write(f'<div class="card"><h3>Запись {i}</h3>\n')
                 for col in columns:
-                    if rec.get(col, "") == "":
-                        continue
+                    raw = rec.get(col, "")
+                    val = format_quik_value(col, raw)
+                    css = ' class="empty"' if _is_empty(raw) else ""
                     f.write(
                         f'<div class="field"><b>{_esc(header_map[col])}:</b> '
-                        f'{_esc(format_quik_value(col, rec[col]))}</div>\n')
+                        f'<span{css}>{_esc(val)}</span></div>\n')
                 f.write("</div>\n")
         else:
             f.write("<table><thead><tr>")
@@ -400,12 +404,15 @@ def export_html(xml_path, out_path, namespace=None,
             for rec in records:
                 f.write("<tr>")
                 for col in columns:
-                    cls = ("num"
-                           if base_field_name(col) in QUIK_NUMERIC_FIELDS
-                           else "")
-                    f.write(
-                        f'<td class="{cls}">'
-                        f'{_esc(format_quik_value(col, rec.get(col, "")))}</td>')
+                    raw = rec.get(col, "")
+                    val = format_quik_value(col, raw)
+                    classes = []
+                    if base_field_name(col) in QUIK_NUMERIC_FIELDS:
+                        classes.append("num")
+                    if _is_empty(raw):
+                        classes.append("empty")
+                    cls_attr = f' class="{" ".join(classes)}"' if classes else ""
+                    f.write(f'<td{cls_attr}>{_esc(val)}</td>')
                 f.write("</tr>\n")
             f.write("</tbody></table>\n")
 
@@ -488,20 +495,29 @@ def export_pdf(xml_path, out_path, namespace=None,
         for i, rec in enumerate(records, 1):
             story.append(Paragraph(f"<b>Запись {i}</b>", normal))
             for col in columns:
-                if rec.get(col, "") == "":
-                    continue
+                raw = rec.get(col, "")
+                val = format_quik_value(col, raw)
+                if _is_empty(raw):
+                    val_html = f'<font color="#999">{_esc(val)}</font>'
+                else:
+                    val_html = _esc(val)
                 story.append(Paragraph(
-                    f"<b>{_esc(header_map[col])}:</b> "
-                    f"{_esc(format_quik_value(col, rec[col]))}", normal))
+                    f"<b>{_esc(header_map[col])}:</b> {val_html}", normal))
             story.append(Spacer(1, 6))
     else:
         data = [[Paragraph(f"<b>{_esc(header_map[c])}</b>", normal)
                  for c in columns]]
         for rec in records:
-            data.append([
-                Paragraph(_esc(format_quik_value(c, rec.get(c, ""))), normal)
-                for c in columns
-            ])
+            row = []
+            for c in columns:
+                raw = rec.get(c, "")
+                val = format_quik_value(c, raw)
+                if _is_empty(raw):
+                    row.append(Paragraph(
+                        f'<font color="#999">{_esc(val)}</font>', normal))
+                else:
+                    row.append(Paragraph(_esc(val), normal))
+            data.append(row)
 
         avail = (pagesize[0] - 2.4 * cm) / max(len(columns), 1)
         col_widths = [avail] * len(columns)
@@ -534,7 +550,7 @@ class App(tk.Tk):
 
         self.xml_path = tk.StringVar()
         self.format_var = tk.StringVar(value="html")
-        self.view_mode = tk.StringVar(value="cards")
+        self.view_mode = tk.StringVar(value="cards")  # Карточки по умолчанию
 
         self.cancel_flag = threading.Event()
 
@@ -543,7 +559,6 @@ class App(tk.Tk):
     def _build_ui(self):
         pad = {"padx": 10, "pady": 8}
 
-        # 1. Файл
         frame_file = ttk.LabelFrame(self, text="1. XML-файл QUIK")
         frame_file.pack(fill="x", **pad)
         ttk.Entry(frame_file, textvariable=self.xml_path, width=70).pack(
@@ -551,7 +566,6 @@ class App(tk.Tk):
         ttk.Button(frame_file, text="Обзор…", command=self.choose_file).pack(
             side="right", padx=6, pady=6)
 
-        # 2. Представление
         frame_view = ttk.LabelFrame(self, text="2. Представление")
         frame_view.pack(fill="x", **pad)
         ttk.Radiobutton(frame_view, text="Карточки",
@@ -561,8 +575,6 @@ class App(tk.Tk):
                         value="table", variable=self.view_mode).pack(
             side="left", padx=16, pady=8)
 
-
-        # 3. Формат вывода
         frame_fmt = ttk.LabelFrame(self, text="3. Формат вывода")
         frame_fmt.pack(fill="x", **pad)
         for fmt, label in [("html", "HTML"), ("pdf", "PDF")]:
@@ -570,13 +582,11 @@ class App(tk.Tk):
                             variable=self.format_var).pack(
                 side="left", padx=16, pady=8)
 
-        # Прогресс
         frame_prog = ttk.LabelFrame(self, text="Прогресс")
         frame_prog.pack(fill="x", **pad)
         self.progress = ttk.Progressbar(frame_prog, mode="indeterminate")
         self.progress.pack(fill="x", padx=6, pady=8)
 
-        # Кнопки
         frame_btn = ttk.Frame(self)
         frame_btn.pack(fill="x", **pad)
         self.btn_convert = ttk.Button(frame_btn, text="Сформировать отчёт",
