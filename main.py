@@ -35,8 +35,12 @@ DEFAULT_LIMIT = 1000000
 
 EMPTY_MARK = "-"
 
+# Заявка — первая колонка в отчёте
+FIRST_COLUMN = "@TransNum"
+FIRST_COLUMN_LABEL = "Заявка"
+
 QUIK_FIELD_LABELS = {
-    "@TransNum":   "№ транзакции",
+    "@TransNum":   "Заявка",
     "@UID":        "UID",
     "@TransID":    "ID транзакции",
     "@SessionID":  "ID сессии",
@@ -229,7 +233,7 @@ def extract_records(path, record_tag=RECORD_TAG, namespace=None,
 
             rec = {}
 
-            # 1. Атрибуты Trans
+            # 1. Атрибуты Trans (TransNum идёт первым — он первый в XML)
             for k, v in elem.attrib.items():
                 rec[f"@{strip_ns(k)}"] = v
 
@@ -315,9 +319,9 @@ def extract_records(path, record_tag=RECORD_TAG, namespace=None,
 
 def build_card_columns(records, descriptions=None):
     """
-    Набор колонок для КАРТОЧЕК — все ключи, встречающиеся хотя бы в одной
-    записи (в порядке первого появления). Карточка отфильтрует лишние
-    сама — покажет только те поля, которые есть в конкретной записи.
+    Набор колонок для карточек и таблицы — все ключи, встречающиеся
+    хотя бы в одной записи (в порядке первого появления).
+    Заявка (@TransNum) всегда выносится первой.
     """
     seen = {}
     for rec in records:
@@ -325,22 +329,13 @@ def build_card_columns(records, descriptions=None):
             if k not in seen:
                 seen[k] = True
     columns = list(seen.keys())
+
+    # Заявка — всегда первая
+    if FIRST_COLUMN in columns:
+        columns = [FIRST_COLUMN] + [c for c in columns if c != FIRST_COLUMN]
+
     header_map = {c: label_for(c, descriptions) for c in columns}
     return columns, header_map
-
-
-def build_table_columns(records):
-    """
-    Колонки для ТАБЛИЦЫ — только те ключи, которые есть в КАЖДОЙ записи.
-    Порядок — как в первой записи. Никаких «разреженных» столбцов:
-    таблица содержит ровно те же поля, что видны в карточках.
-    """
-    if not records:
-        return []
-    common = set(records[0].keys())
-    for rec in records[1:]:
-        common &= set(rec.keys())
-    return [k for k in records[0] if k in common]
 
 
 # ============================================================
@@ -389,10 +384,7 @@ def export_html(xml_path, out_path, record_tag=RECORD_TAG, namespace=None,
         progress_cb=progress_cb, cancel_flag=cancel_flag,
         max_records=limit))
 
-    # Для карточек — набор всех полей; для таблицы — только общие поля
     card_columns, card_header_map = build_card_columns(records, descriptions)
-    table_columns = build_table_columns(records)
-    table_header_map = {c: label_for(c, descriptions) for c in table_columns}
 
     meta_lines = [
         f"Дата формирования: {datetime.now().strftime('%d.%m.%Y %H:%M')}",
@@ -424,12 +416,12 @@ def export_html(xml_path, out_path, record_tag=RECORD_TAG, namespace=None,
                 f.write("</div>\n")
         else:
             f.write("<table><thead><tr>")
-            for col in table_columns:
-                f.write(f"<th>{_esc(table_header_map[col])}</th>")
+            for col in card_columns:
+                f.write(f"<th>{_esc(card_header_map[col])}</th>")
             f.write("</tr></thead><tbody>\n")
             for rec in records:
                 f.write("<tr>")
-                for col in table_columns:
+                for col in card_columns:
                     cls = ("num"
                            if base_field_name(col) in QUIK_NUMERIC_FIELDS
                            else "")
@@ -484,19 +476,19 @@ def export_pdf(xml_path, out_path, record_tag=RECORD_TAG, namespace=None,
 
     # ---- Подбор формата страницы по числу колонок ----
     if as_cards or ncols <= 6:
-        pagesize = A4                          # 297 × 210 мм (landscape)
+        pagesize = A4
         body_font_size = 9
     elif ncols <= 10:
-        pagesize = landscape(A3)               # 420 × 297 мм
+        pagesize = landscape(A3)
         body_font_size = 8
     elif ncols <= 16:
-        pagesize = landscape(A2)               # 594 × 420 мм
+        pagesize = landscape(A2)
         body_font_size = 8
     elif ncols <= 24:
-        pagesize = landscape(A1)               # 841 × 594 мм
+        pagesize = landscape(A1)
         body_font_size = 7
     else:
-        pagesize = landscape(A0)               # 1189 × 841 мм
+        pagesize = landscape(A0)
         body_font_size = 7
 
     h1 = ParagraphStyle("H1", parent=styles["Heading1"], fontName=font,
@@ -595,7 +587,6 @@ class App(tk.Tk):
     def _build_ui(self):
         pad = {"padx": 10, "pady": 8}
 
-        # 1. Файл
         frame_file = ttk.LabelFrame(self, text="1. XML-файл QUIK")
         frame_file.pack(fill="x", **pad)
         ttk.Entry(frame_file, textvariable=self.xml_path, width=70).pack(
@@ -603,7 +594,6 @@ class App(tk.Tk):
         ttk.Button(frame_file, text="Обзор…", command=self.choose_file).pack(
             side="right", padx=6, pady=6)
 
-        # 2. Представление
         frame_view = ttk.LabelFrame(self, text="2. Представление")
         frame_view.pack(fill="x", **pad)
         ttk.Radiobutton(frame_view, text="Карточки",
@@ -613,7 +603,6 @@ class App(tk.Tk):
                         value="table", variable=self.view_mode).pack(
             side="left", padx=16, pady=8)
 
-        # 3. Формат вывода
         frame_fmt = ttk.LabelFrame(self, text="3. Формат вывода")
         frame_fmt.pack(fill="x", **pad)
         for fmt, label in [("html", "HTML"), ("pdf", "PDF")]:
@@ -621,13 +610,11 @@ class App(tk.Tk):
                             variable=self.format_var).pack(
                 side="left", padx=16, pady=8)
 
-        # Прогресс
         frame_prog = ttk.LabelFrame(self, text="Прогресс")
         frame_prog.pack(fill="x", **pad)
         self.progress = ttk.Progressbar(frame_prog, mode="indeterminate")
         self.progress.pack(fill="x", padx=6, pady=8)
 
-        # Кнопки
         frame_btn = ttk.Frame(self)
         frame_btn.pack(fill="x", **pad)
         self.btn_convert = ttk.Button(frame_btn, text="Сформировать отчёт",
