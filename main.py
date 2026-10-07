@@ -1,6 +1,7 @@
 import os
 import re
 import html
+import tempfile
 import threading
 from datetime import datetime
 import tkinter as tk
@@ -37,6 +38,9 @@ DEFAULT_LIMIT = 1000000
 EMPTY_MARK = "-"
 RECORD_NUM_COL = "__record_num__"
 
+# Размер чанка при чтении/записи
+CLEAN_CHUNK = 4 * 1024 * 1024   # 4 МБ
+
 QUIK_FIELD_LABELS = {
     RECORD_NUM_COL: "Запись",
 
@@ -71,19 +75,18 @@ QUIK_NUMERIC_FIELDS = {
 
 
 # ============================================================
-# 0.1. САНИТИЗАЦИЯ XML (для QUIK-битых ""..."" и &)
+# 0.1. САНИТИЗАЦИЯ XML — отдельный проход по файлу
 # ============================================================
 
 # Неэкранированные &, кроме уже валидных сущностей
 _AMP_FIX = re.compile(rb'&(?!amp;|lt;|gt;|quot;|apos;|#\d+;)')
 
-# Сломанный QUIK-шаблон: =""X""  где X — непустое содержимое
-# Условия:
-#   =""               — начало значения с лишней кавычкой
-#   [^"\s/<>]         — первый символ не пробел, не /, не <, не >, не "
-#   [^"]*             — остаток содержимого без кавычек
-#   ""                — две кавычки в конце значения
-#   (?=[\s/>])        — сразу за ними пробел, / или > (конец атрибута)
+# Сломанный QUIK-шаблон: =""X""   где X — непустое содержимое
+#    =""              — начало значения с лишней кавычкой
+#    [^"\s/<>]        — первый символ не пробел, не /, не <, не >, не "
+#    [^"]*            — остаток содержимого без кавычек
+#    ""               — две кавычки в конце значения
+#    (?=[\s/>])       — сразу за ними пробел, / или > (конец атрибута)
 _BROKEN_QUOTE = re.compile(rb'=""([^"\s/<>][^"]*)""(?=[\s/>])')
 
 
@@ -94,12 +97,41 @@ def _sanitize_tag(tag_bytes):
     return tag_bytes
 
 
-def _sanitize_chunk(raw):
+def clean_xml_file(src_path, dst_path, progress_cb=None, cancel_flag=None):
     """
-    Чистит кусок XML по тегам.
-    Возвращает (cleaned_bytes, pending_bytes):
-      - cleaned — то, что готово к парсеру,
-      - pending — незакрытый тег в конце чанка (склеить со следующим).
+    Первый проход: читаем src_path кусками по 4 МБ, чиним битые кавычки
+    и неэкранированные & внутри тегов, пишем в dst_path.
+    Память O(1), никаких 30 ГБ в RAM.
+    """
+    pending = b""
+    total_read = 0
+
+    with open(src_path, "rb") as fi, open(dst_path, "wb") as fo:
+        while True:
+            if cancel_flag and cancel_flag.is_set():
+                raise RuntimeError("Отменено пользователем")
+
+            chunk = fi.read(CLEAN_CHUNK)
+            if not chunk:
+                # хвост
+                if pending:
+                    cleaned, _ = _process_clean_data(pending, final=True)
+                    fo.write(cleaned)
+                break
+
+            data = pending + chunk
+            cleaned, pending = _process_clean_data(data, final=False)
+            fo.write(cleaned)
+
+            total_read += len(chunk)
+            if progress_cb and total_read % (CLEAN_CHUNK * 10) == 0:
+                progress_cb(total_read)
+
+
+def _process_clean_data(raw, final):
+    """
+    Чистит кусок XML, разбивая по тегам.
+    Возвращает (cleaned, pending). Если final=True — pending пустой.
     """
     out = bytearray()
     pos = 0
@@ -108,12 +140,13 @@ def _sanitize_chunk(raw):
     while pos < n:
         lt = raw.find(b'<', pos)
         if lt == -1:
+            # дальше только текст
             out.extend(raw[pos:])
             return bytes(out), b""
 
         out.extend(raw[pos:lt])  # текст до тега — не трогаем
 
-        # пропускаем комментарии
+        # комментарий
         if raw[lt:lt + 4] == b'<!--':
             end = raw.find(b'-->', lt)
             if end == -1:
@@ -122,7 +155,7 @@ def _sanitize_chunk(raw):
             pos = end + 3
             continue
 
-        # пропускаем CDATA
+        # CDATA
         if raw[lt:lt + 9] == b'<![CDATA[':
             end = raw.find(b']]>', lt)
             if end == -1:
@@ -131,73 +164,20 @@ def _sanitize_chunk(raw):
             pos = end + 3
             continue
 
+        # обычный тег — ищем закрывающий >
         gt = raw.find(b'>', lt)
         if gt == -1:
-            # тег обрывается на границе чанка — отдаём как pending
+            # тег не закрылся в этом куске
+            if final:
+                # конец файла — отдаём как есть, пусть парсер сам решит
+                out.extend(raw[lt:])
+                return bytes(out), b""
             return bytes(out), raw[lt:]
 
         out.extend(_sanitize_tag(raw[lt:gt + 1]))
         pos = gt + 1
 
     return bytes(out), b""
-
-
-class SanitizedFile:
-    """
-    Обёртка над файлом, которая на лету чинит QUIK-битые ""..."" и &.
-    Читает файл кусками по 4 МБ, память O(1) по размеру файла.
-    """
-    CHUNK = 4 * 1024 * 1024
-
-    def __init__(self, path):
-        self._f = open(path, "rb")
-        self._buffer = bytearray()
-        self._pending = b""
-        self._eof = False
-
-    def _fill(self):
-        while not self._eof and not self._buffer:
-            chunk = self._f.read(self.CHUNK)
-            if not chunk:
-                if self._pending:
-                    self._buffer.extend(self._pending)
-                    self._pending = b""
-                self._eof = True
-                break
-            data = self._pending + chunk
-            cleaned, self._pending = _sanitize_chunk(data)
-            self._buffer.extend(cleaned)
-
-    def read(self, size=-1):
-        if size is None or size < 0:
-            while not self._eof:
-                self._fill()
-            result = bytes(self._buffer)
-            self._buffer.clear()
-            return result
-
-        while len(self._buffer) < size and not self._eof:
-            self._fill()
-
-        if not self._buffer:
-            return b""
-
-        take = min(size, len(self._buffer))
-        result = bytes(self._buffer[:take])
-        del self._buffer[:take]
-        return result
-
-    def close(self):
-        try:
-            self._f.close()
-        except Exception:
-            pass
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        self.close()
 
 
 # ============================================================
@@ -277,12 +257,11 @@ def format_quik_value(col, value):
 
 
 def detect_namespace(path):
-    """Читает xmlns из первых 8 КБ файла. Не парсит весь файл."""
+    """Читает xmlns из первых 8 КБ файла."""
     try:
         with open(path, "rb") as f:
             head = f.read(8192)
-        cleaned, _ = _sanitize_chunk(head)
-        m = re.search(rb'xmlns\s*=\s*"([^"]+)"', cleaned)
+        m = re.search(rb'xmlns\s*=\s*"([^"]+)"', head)
         if m:
             return m.group(1).decode("ascii", errors="ignore")
     except Exception:
@@ -296,11 +275,10 @@ def read_report_header(path):
     try:
         with open(path, "rb") as f:
             head = f.read(8192)
-        cleaned, _ = _sanitize_chunk(head)
         for key in ("ProgramVersion", "StartDate", "EndDate"):
             m = re.search(
                 rb'%s\s*=\s*"([^"]*)"' % key.encode("ascii"),
-                cleaned
+                head
             )
             if m:
                 info[key] = m.group(1).decode("utf-8", errors="replace")
@@ -349,9 +327,7 @@ def extract_records(path, record_tag=RECORD_TAG, namespace=None,
                     config=None, descriptions=None,
                     progress_cb=None, cancel_flag=None, max_records=None):
     """
-    Потоковый разбор QUIK XML.
-    Файл читается через SanitizedFile — все ""..."" на лету заменяются
-    на &quot;...&quot;, поэтому парсер не падает.
+    Работает с уже очищенным файлом. Обычный iterparse.
     """
     if config is None:
         config = ExtractConfig()
@@ -360,7 +336,7 @@ def extract_records(path, record_tag=RECORD_TAG, namespace=None,
 
     search_tag = qname(record_tag, namespace)
 
-    with SanitizedFile(path) as f:
+    with open(path, "rb") as f:
         context = ET.iterparse(f, events=("end",), tag=search_tag)
 
         count = 0
@@ -404,7 +380,7 @@ def extract_records(path, record_tag=RECORD_TAG, namespace=None,
                         if desc and name not in descriptions:
                             descriptions[name] = desc
 
-                        display = prepared  # ТОЛЬКО PreparedValue
+                        display = prepared
 
                         if name in rec:
                             i = 2
@@ -509,14 +485,14 @@ def _esc(s):
     return html.escape(str(s))
 
 
-def export_html(xml_path, out_path, record_tag=RECORD_TAG, namespace=None,
-                config=None, limit=DEFAULT_LIMIT, progress_cb=None,
-                cancel_flag=None, as_cards=False):
-    header = read_report_header(xml_path)
+def export_html(clean_xml_path, out_path, record_tag=RECORD_TAG,
+                namespace=None, config=None, limit=DEFAULT_LIMIT,
+                progress_cb=None, cancel_flag=None, as_cards=False):
+    header = read_report_header(clean_xml_path)
 
     descriptions = {}
     records = list(extract_records(
-        xml_path, record_tag, namespace,
+        clean_xml_path, record_tag, namespace,
         config=config, descriptions=descriptions,
         progress_cb=progress_cb, cancel_flag=cancel_flag,
         max_records=limit))
@@ -524,7 +500,6 @@ def export_html(xml_path, out_path, record_tag=RECORD_TAG, namespace=None,
     inject_record_numbers(records)
 
     card_columns, card_header_map = build_card_columns(records, descriptions)
-
     table_columns = build_table_columns(card_columns)
     table_header_map = {RECORD_NUM_COL: "Запись"}
     table_header_map.update(card_header_map)
@@ -538,7 +513,7 @@ def export_html(xml_path, out_path, record_tag=RECORD_TAG, namespace=None,
         meta_lines.append(f"Период: {s} — {e}")
     if header.get("ProgramVersion"):
         meta_lines.append(f"Версия QUIK: {header['ProgramVersion']}")
-    meta_lines.append(f"Источник: {os.path.basename(xml_path)}")
+    meta_lines.append(f"Источник: {os.path.basename(clean_xml_path)}")
     meta_lines.append(f"Записей: {len(records)}")
 
     with open(out_path, "w", encoding="utf-8") as f:
@@ -597,18 +572,18 @@ def register_cyrillic_font():
     return "Helvetica"
 
 
-def export_pdf(xml_path, out_path, record_tag=RECORD_TAG, namespace=None,
-               config=None, limit=DEFAULT_LIMIT, progress_cb=None,
-               cancel_flag=None, as_cards=False):
+def export_pdf(clean_xml_path, out_path, record_tag=RECORD_TAG,
+               namespace=None, config=None, limit=DEFAULT_LIMIT,
+               progress_cb=None, cancel_flag=None, as_cards=False):
     font = register_cyrillic_font()
 
     styles = getSampleStyleSheet()
 
-    header = read_report_header(xml_path)
+    header = read_report_header(clean_xml_path)
 
     descriptions = {}
     records = list(extract_records(
-        xml_path, record_tag, namespace,
+        clean_xml_path, record_tag, namespace,
         config=config, descriptions=descriptions,
         progress_cb=progress_cb, cancel_flag=cancel_flag,
         max_records=limit))
@@ -616,7 +591,6 @@ def export_pdf(xml_path, out_path, record_tag=RECORD_TAG, namespace=None,
     inject_record_numbers(records)
 
     card_columns, card_header_map = build_card_columns(records, descriptions)
-
     table_columns = build_table_columns(card_columns)
     table_header_map = {RECORD_NUM_COL: "Запись"}
     table_header_map.update(card_header_map)
@@ -667,7 +641,7 @@ def export_pdf(xml_path, out_path, record_tag=RECORD_TAG, namespace=None,
         meta_lines.append(f"Период: {s} — {e}")
     if header.get("ProgramVersion"):
         meta_lines.append(f"Версия QUIK: {header['ProgramVersion']}")
-    meta_lines.append(f"Источник: {os.path.basename(xml_path)}")
+    meta_lines.append(f"Источник: {os.path.basename(clean_xml_path)}")
     meta_lines.append(f"Записей: {len(records)}")
 
     for line in meta_lines:
@@ -792,6 +766,10 @@ class App(tk.Tk):
         if count % 5000 == 0:
             self._set_status(f"Обработано записей: {count:,}", "blue")
 
+    def _clean_progress_cb(self, bytes_read):
+        mb = bytes_read // (1024 * 1024)
+        self._set_status(f"Очистка XML: {mb} МБ обработано", "blue")
+
     def convert(self):
         xml_file = self.xml_path.get().strip()
         if not xml_file or not os.path.isfile(xml_file):
@@ -819,24 +797,41 @@ class App(tk.Tk):
         self._set_status("Формирование отчёта…", "blue")
 
         def worker():
+            clean_path = None
             try:
-                namespace = detect_namespace(xml_file)
-                self._set_status(
-                    f"Namespace: {namespace or '—'}. Разбор транзакций…",
-                    "blue")
+                # 1. Создаём временный файл рядом с исходным
+                #    (чтобы не улететь на другой диск — там может не быть места)
+                src_dir = os.path.dirname(os.path.abspath(xml_file))
+                tmp_fd, clean_path = tempfile.mkstemp(
+                    prefix="quik_clean_", suffix=".xml", dir=src_dir)
+                os.close(tmp_fd)
+
+                # 2. Очистка файла — первый проход
+                self._set_status("Очистка XML…", "blue")
+                clean_xml_file(
+                    xml_file, clean_path,
+                    progress_cb=self._clean_progress_cb,
+                    cancel_flag=self.cancel_flag)
 
                 if self.cancel_flag.is_set():
                     raise RuntimeError("Отменено")
 
+                # 3. Определяем namespace уже в чистом файле
+                namespace = detect_namespace(clean_path)
+                self._set_status(
+                    f"Namespace: {namespace or '—'}. Разбор транзакций…",
+                    "blue")
+
+                # 4. Строим отчёт из чистого файла
                 if fmt == "html":
-                    export_html(xml_file, out_path, RECORD_TAG,
+                    export_html(clean_path, out_path, RECORD_TAG,
                                 namespace=namespace, config=config,
                                 limit=DEFAULT_LIMIT,
                                 progress_cb=self._progress_cb,
                                 cancel_flag=self.cancel_flag,
                                 as_cards=as_cards)
                 elif fmt == "pdf":
-                    export_pdf(xml_file, out_path, RECORD_TAG,
+                    export_pdf(clean_path, out_path, RECORD_TAG,
                                namespace=namespace, config=config,
                                limit=DEFAULT_LIMIT,
                                progress_cb=self._progress_cb,
@@ -851,7 +846,15 @@ class App(tk.Tk):
             except Exception as exc:
                 err = f"{type(exc).__name__}: {exc}"
                 self.after(0, self._show_error, "Ошибка", err)
+
             finally:
+                # 5. Удаляем временный файл
+                if clean_path and os.path.exists(clean_path):
+                    try:
+                        os.remove(clean_path)
+                    except Exception:
+                        pass
+
                 self.after(0, self._reset_ui)
 
         threading.Thread(target=worker, daemon=True).start()
