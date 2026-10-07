@@ -4,6 +4,7 @@ import html
 import queue
 import tempfile
 import threading
+import time
 from datetime import datetime
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -11,12 +12,8 @@ from tkinter import ttk, filedialog, messagebox
 from lxml import etree as ET
 
 from reportlab.lib.pagesizes import A4, landscape, A3, A2, A1, A0
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import cm
-from reportlab.lib import colors
-from reportlab.platypus import (
-    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle,
-)
+from reportlab.pdfgen import canvas as rl_canvas
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 
@@ -39,10 +36,7 @@ DEFAULT_LIMIT = 1000000
 EMPTY_MARK = "-"
 RECORD_NUM_COL = "__record_num__"
 
-# Размер чанка при чтении/записи
-CLEAN_CHUNK = 4 * 1024 * 1024   # 4 МБ
-
-# Глубина очередей (сколько чанков может висеть между потоками)
+CLEAN_CHUNK = 4 * 1024 * 1024
 QUEUE_DEPTH = 4
 
 QUIK_FIELD_LABELS = {
@@ -79,18 +73,33 @@ QUIK_NUMERIC_FIELDS = {
 
 
 # ============================================================
-# 0.1. САНИТИЗАЦИЯ XML — ускоренная + конвейерная
+# 0.1. ФОРМАТИРОВАНИЕ ВРЕМЕНИ
 # ============================================================
 
-# Неэкранированные &, кроме уже валидных сущностей
-_AMP_FIX = re.compile(rb'&(?!amp;|lt;|gt;|quot;|apos;|#\d+;)')
+def fmt_duration(seconds):
+    """Секунды → '1 ч 23 мин 45 с' (или '12 с')."""
+    seconds = int(seconds)
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
+    parts = []
+    if h:
+        parts.append(f"{h} ч")
+    if m or h:
+        parts.append(f"{m} мин")
+    parts.append(f"{s} с")
+    return " ".join(parts)
 
-# Сломанный QUIK-шаблон: =""X""
+
+# ============================================================
+# 0.2. САНИТИЗАЦИЯ XML
+# ============================================================
+
+_AMP_FIX = re.compile(rb'&(?!amp;|lt;|gt;|quot;|apos;|#\d+;)')
 _BROKEN_QUOTE = re.compile(rb'=""([^"\s/<>][^"]*)""(?=[\s/>])')
 
 
 def _sanitize_tag(tag_bytes):
-    """Чистит один тег: незаэкранированный & и QUIK-битые ""...""."""
     if b'&' in tag_bytes:
         tag_bytes = _AMP_FIX.sub(b'&amp;', tag_bytes)
     if b'=""' in tag_bytes:
@@ -99,11 +108,6 @@ def _sanitize_tag(tag_bytes):
 
 
 def _process_clean_data(raw, final):
-    """
-    Ускоренная очистка куска XML.
-    Разбиение на теги через bytes.split — цикл в C, не в Python.
-    Возвращает (cleaned, pending).
-    """
     out = bytearray()
     pos = 0
     n = len(raw)
@@ -114,10 +118,8 @@ def _process_clean_data(raw, final):
             out.extend(raw[pos:])
             return bytes(out), b""
 
-        # текст до тега — не трогаем
         out.extend(raw[pos:lt])
 
-        # комментарий
         if raw[lt:lt + 4] == b'<!--':
             end = raw.find(b'-->', lt)
             if end == -1:
@@ -126,7 +128,6 @@ def _process_clean_data(raw, final):
             pos = end + 3
             continue
 
-        # CDATA
         if raw[lt:lt + 9] == b'<![CDATA[':
             end = raw.find(b']]>', lt)
             if end == -1:
@@ -142,10 +143,7 @@ def _process_clean_data(raw, final):
                 return bytes(out), b""
             return bytes(out), raw[lt:]
 
-        # ---- быстрая санитизация одного тега ----
         tag = raw[lt:gt + 1]
-
-        # быстрая проверка, нужно ли чистить вообще
         if b'&' in tag or b'=""' in tag:
             tag = _sanitize_tag(tag)
 
@@ -156,7 +154,6 @@ def _process_clean_data(raw, final):
 
 
 def _reader_thread(fi, raw_q, cancel_flag, clean_progress_cb, total_size):
-    """Поток 1: читает исходный файл и кладёт чанки в raw_q."""
     try:
         total_read = 0
         while True:
@@ -170,11 +167,10 @@ def _reader_thread(fi, raw_q, cancel_flag, clean_progress_cb, total_size):
             if clean_progress_cb:
                 clean_progress_cb(total_read, total_size)
     finally:
-        raw_q.put(None)  # сигнал конца
+        raw_q.put(None)
 
 
 def _cleaner_thread(raw_q, clean_q, cancel_flag):
-    """Поток 2: чистит чанки из raw_q и кладёт в clean_q."""
     pending = b""
     try:
         while True:
@@ -182,7 +178,6 @@ def _cleaner_thread(raw_q, clean_q, cancel_flag):
                 break
             chunk = raw_q.get()
             if chunk is None:
-                # конец — обработаем остаток
                 if pending:
                     cleaned, _ = _process_clean_data(pending, final=True)
                     if cleaned:
@@ -194,11 +189,10 @@ def _cleaner_thread(raw_q, clean_q, cancel_flag):
             if cleaned:
                 clean_q.put(cleaned)
     finally:
-        clean_q.put(None)  # сигнал конца
+        clean_q.put(None)
 
 
 def _writer_thread(fo, clean_q, cancel_flag):
-    """Поток 3: пишет очищенные чанки в файл."""
     try:
         while True:
             chunk = clean_q.get()
@@ -212,10 +206,6 @@ def _writer_thread(fo, clean_q, cancel_flag):
 
 
 def clean_xml_file(src_path, dst_path, progress_cb=None, cancel_flag=None):
-    """
-    Очистка XML в конвейере из трёх потоков.
-    progress_cb получает (bytes_read, total_size).
-    """
     total_size = os.path.getsize(src_path)
 
     raw_q = queue.Queue(maxsize=QUEUE_DEPTH)
@@ -292,7 +282,6 @@ def label_for(field_name, descriptions=None):
 
 
 def format_quik_value(col, value):
-    """Форматирование PreparedValue. Пустое -> «-»."""
     base = base_field_name(col)
     if value is None:
         return EMPTY_MARK
@@ -548,7 +537,8 @@ def _esc(s):
 
 def export_html(clean_xml_path, out_path, record_tag=RECORD_TAG,
                 namespace=None, config=None, limit=DEFAULT_LIMIT,
-                progress_cb=None, cancel_flag=None, as_cards=False):
+                progress_cb=None, cancel_flag=None, as_cards=False,
+                started_at=None, finished_at=None):
     header = read_report_header(clean_xml_path)
 
     descriptions = {}
@@ -565,8 +555,17 @@ def export_html(clean_xml_path, out_path, record_tag=RECORD_TAG,
     table_header_map = {RECORD_NUM_COL: "Запись"}
     table_header_map.update(card_header_map)
 
+    # Формируем метаданные с датами
+    now = datetime.now()
+    started_at = started_at or now
+    finished_at = finished_at or now
+    duration_sec = (finished_at - started_at).total_seconds()
+
     meta_lines = [
-        f"Дата формирования: {datetime.now().strftime('%d.%m.%Y %H:%M')}",
+        f"Дата формирования: {now.strftime('%d.%m.%Y %H:%M:%S')}",
+        f"Начало обработки: {started_at.strftime('%d.%m.%Y %H:%M:%S')}",
+        f"Конец обработки: {finished_at.strftime('%d.%m.%Y %H:%M:%S')}",
+        f"Затрачено времени: {fmt_duration(duration_sec)}",
     ]
     if header.get("StartDate") or header.get("EndDate"):
         s = format_date_string(header.get("StartDate", ""))
@@ -577,7 +576,6 @@ def export_html(clean_xml_path, out_path, record_tag=RECORD_TAG,
     meta_lines.append(f"Источник: {os.path.basename(clean_xml_path)}")
     meta_lines.append(f"Записей: {len(records)}")
 
-    # Буферизованная запись — крупный буфер в 1 МБ
     with open(out_path, "w", encoding="utf-8",
               buffering=1024 * 1024) as f:
         f.write(HTML_HEAD.format(
@@ -616,7 +614,7 @@ def export_html(clean_xml_path, out_path, record_tag=RECORD_TAG,
 
 
 # ============================================================
-# 6. PDF
+# 6. PDF через Canvas
 # ============================================================
 
 def register_cyrillic_font():
@@ -635,25 +633,49 @@ def register_cyrillic_font():
     return "Helvetica"
 
 
+def _fit_text(text, font_name, font_size, max_width, pdf_canvas):
+    if not text:
+        return ""
+    text = str(text)
+    if pdf_canvas.stringWidth(text, font_name, font_size) <= max_width:
+        return text
+    ellipsis = "…"
+    ell_w = pdf_canvas.stringWidth(ellipsis, font_name, font_size)
+    lo, hi = 0, len(text)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        w = pdf_canvas.stringWidth(text[:mid], font_name, font_size)
+        if w + ell_w <= max_width:
+            lo = mid
+        else:
+            hi = mid - 1
+    return text[:lo] + ellipsis
+
+
 def export_pdf(clean_xml_path, out_path, record_tag=RECORD_TAG,
                namespace=None, config=None, limit=DEFAULT_LIMIT,
-               progress_cb=None, cancel_flag=None, as_cards=False):
+               progress_cb=None, cancel_flag=None, as_cards=False,
+               started_at=None, finished_at=None):
     font = register_cyrillic_font()
-
-    styles = getSampleStyleSheet()
 
     header = read_report_header(clean_xml_path)
 
+    # Пробный проход — только для определения колонок
     descriptions = {}
-    records = list(extract_records(
-        clean_xml_path, record_tag, namespace,
-        config=config, descriptions=descriptions,
-        progress_cb=progress_cb, cancel_flag=cancel_flag,
-        max_records=limit))
+    sample = []
+    for i, rec in enumerate(extract_records(
+            clean_xml_path, record_tag, namespace,
+            config=config, descriptions=descriptions,
+            progress_cb=None, cancel_flag=cancel_flag,
+            max_records=200)):
+        sample.append(rec)
+        if cancel_flag and cancel_flag.is_set():
+            return
 
-    inject_record_numbers(records)
+    if not sample:
+        sample = [{}]
 
-    card_columns, card_header_map = build_card_columns(records, descriptions)
+    card_columns, card_header_map = build_card_columns(sample, descriptions)
     table_columns = build_table_columns(card_columns)
     table_header_map = {RECORD_NUM_COL: "Запись"}
     table_header_map.update(card_header_map)
@@ -678,76 +700,173 @@ def export_pdf(clean_xml_path, out_path, record_tag=RECORD_TAG,
         pagesize = landscape(A0)
         body_font_size = 7
 
-    h1 = ParagraphStyle("H1", parent=styles["Heading1"], fontName=font,
-                        fontSize=16, leading=20)
-    normal = ParagraphStyle("N", parent=styles["Normal"], fontName=font,
-                            fontSize=body_font_size,
-                            leading=body_font_size + 2)
-    small = ParagraphStyle("S", parent=styles["Normal"], fontName=font,
-                           fontSize=8, leading=10, textColor=colors.grey)
+    page_w, page_h = pagesize
+    margin = 1.0 * cm
+    usable_w = page_w - 2 * margin
 
-    doc = SimpleDocTemplate(
-        out_path, pagesize=pagesize,
-        leftMargin=1.0 * cm, rightMargin=1.0 * cm,
-        topMargin=1.0 * cm, bottomMargin=1.0 * cm,
-    )
+    if ncols_table > 0:
+        record_col_w = min(1.4 * cm, usable_w * 0.06)
+        other_cols = max(ncols_table - 1, 1)
+        other_col_w = (usable_w - record_col_w) / other_cols
+        col_widths = [record_col_w] + [other_col_w] * other_cols
+    else:
+        col_widths = []
 
-    story = []
-    story.append(Paragraph("Отчёт по транзакциям QUIK", h1))
+    header_font_size = body_font_size
+    header_row_h = header_font_size * 1.8
+    row_h = body_font_size * 1.6
+    meta_line_h = 10
 
-    meta_lines = [
-        f"Дата формирования: {datetime.now().strftime('%d.%m.%Y %H:%M')}",
-    ]
-    if header.get("StartDate") or header.get("EndDate"):
-        s = format_date_string(header.get("StartDate", ""))
-        e = format_date_string(header.get("EndDate", ""))
-        meta_lines.append(f"Период: {s} — {e}")
-    if header.get("ProgramVersion"):
-        meta_lines.append(f"Версия QUIK: {header['ProgramVersion']}")
-    meta_lines.append(f"Источник: {os.path.basename(clean_xml_path)}")
-    meta_lines.append(f"Записей: {len(records)}")
+    c = rl_canvas.Canvas(out_path, pagesize=pagesize)
+    c.setTitle("Отчёт по транзакциям QUIK")
 
-    for line in meta_lines:
-        story.append(Paragraph(_esc(line), small))
-    story.append(Spacer(1, 8))
+    now = datetime.now()
+    started_at = started_at or now
+    finished_at = finished_at or now
+    duration_sec = (finished_at - started_at).total_seconds()
 
+    def draw_report_header(is_first_page):
+        y = page_h - margin
+
+        c.setFont(font, 16)
+        c.drawString(margin, y - 16, "Отчёт по транзакциям QUIK")
+        y -= 26
+
+        if is_first_page:
+            c.setFont(font, 8)
+            meta_lines = [
+                f"Дата формирования: "
+                f"{now.strftime('%d.%m.%Y %H:%M:%S')}",
+                f"Начало обработки: "
+                f"{started_at.strftime('%d.%m.%Y %H:%M:%S')}",
+                f"Конец обработки: "
+                f"{finished_at.strftime('%d.%m.%Y %H:%M:%S')}",
+                f"Затрачено времени: {fmt_duration(duration_sec)}",
+            ]
+            if header.get("StartDate") or header.get("EndDate"):
+                s = format_date_string(header.get("StartDate", ""))
+                e = format_date_string(header.get("EndDate", ""))
+                meta_lines.append(f"Период: {s} — {e}")
+            if header.get("ProgramVersion"):
+                meta_lines.append(
+                    f"Версия QUIK: {header['ProgramVersion']}")
+            meta_lines.append(
+                f"Источник: {os.path.basename(clean_xml_path)}")
+
+            for line in meta_lines:
+                c.drawString(margin, y, line)
+                y -= meta_line_h
+            y -= 4
+        else:
+            y -= 4
+
+        return y
+
+    def draw_table_header(y):
+        c.setFont(font, header_font_size)
+        x = margin
+        for col, w in zip(table_columns, col_widths):
+            text = table_header_map.get(col, col)
+            text = _fit_text(text, font, header_font_size, w - 4, c)
+            c.drawString(x + 2, y - header_font_size, text)
+            x += w
+        y_line = y - header_row_h + 2
+        c.setLineWidth(0.6)
+        c.setStrokeColorRGB(0.3, 0.3, 0.3)
+        c.line(margin, y_line, margin + usable_w, y_line)
+        c.setStrokeColorRGB(0, 0, 0)
+        c.setLineWidth(0.25)
+        return y - header_row_h
+
+    # ────── Карточки ──────
     if as_cards:
-        for i, rec in enumerate(records, 1):
-            story.append(Paragraph(f"<b>Запись {i}</b>", normal))
-            for col in card_columns:
-                if col not in rec:
-                    continue
-                story.append(Paragraph(
-                    f"<b>{_esc(card_header_map[col])}:</b> "
-                    f"{_esc(format_quik_value(col, rec[col]))}", normal))
-            story.append(Spacer(1, 6))
-        doc.build(story)
+        page_y = draw_report_header(True)
+        item_index = 0
+
+        for rec in extract_records(
+                clean_xml_path, record_tag, namespace,
+                config=config, descriptions=descriptions,
+                progress_cb=progress_cb, cancel_flag=cancel_flag,
+                max_records=limit):
+            if cancel_flag and cancel_flag.is_set():
+                break
+
+            item_index += 1
+            fields_in_rec = [col for col in card_columns if col in rec]
+            card_h = (len(fields_in_rec) + 1) * row_h + 8
+
+            if page_y - card_h < margin:
+                c.showPage()
+                page_y = draw_report_header(False)
+
+            c.setFont(font, body_font_size + 1)
+            c.drawString(margin, page_y - body_font_size - 1,
+                         f"Запись {item_index}")
+            page_y -= row_h
+
+            c.setFont(font, body_font_size)
+            for col in fields_in_rec:
+                label = card_header_map.get(col, col)
+                val = format_quik_value(col, rec[col])
+                line = f"{label}: {val}"
+                line = _fit_text(line, font, body_font_size, usable_w, c)
+                c.drawString(margin + 6, page_y - body_font_size, line)
+                page_y -= row_h
+
+            page_y -= 4
+
+            if progress_cb and item_index % 5000 == 0:
+                progress_cb(item_index)
+
+        c.showPage()
+        c.save()
         return
 
-    data = [[Paragraph(f"<b>{_esc(table_header_map[c])}</b>", normal)
-             for c in table_columns]]
-    for rec in records:
-        data.append([
-            Paragraph(_esc(format_quik_value(c, rec.get(c, ""))), normal)
-            for c in table_columns
-        ])
+    # ────── Таблица ──────
+    page_y = draw_report_header(True)
+    page_y = draw_table_header(page_y)
 
-    avail = (pagesize[0] - 2.0 * cm) / max(len(table_columns), 1)
-    col_widths = [avail] * len(table_columns)
+    rows_on_page = 0
+    max_rows_per_page = max(int((page_y - margin) / row_h), 10)
+    row_num = 0
 
-    tbl = Table(data, colWidths=col_widths, repeatRows=1)
-    tbl.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#f0f4f8")),
-        ("GRID", (0, 0), (-1, -1), 0.4, colors.grey),
-        ("VALIGN", (0, 0), (-1, -1), "TOP"),
-        ("LEFTPADDING", (0, 0), (-1, -1), 3),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 3),
-        ("TOPPADDING", (0, 0), (-1, -1), 2),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
-    ]))
-    story.append(tbl)
+    for rec in extract_records(
+            clean_xml_path, record_tag, namespace,
+            config=config, descriptions=descriptions,
+            progress_cb=progress_cb, cancel_flag=cancel_flag,
+            max_records=limit):
+        if cancel_flag and cancel_flag.is_set():
+            break
 
-    doc.build(story)
+        row_num += 1
+
+        if rows_on_page >= max_rows_per_page:
+            c.showPage()
+            page_y = draw_report_header(False)
+            page_y = draw_table_header(page_y)
+            max_rows_per_page = max(int((page_y - margin) / row_h), 10)
+            rows_on_page = 0
+
+        row_vals = {RECORD_NUM_COL: str(row_num)}
+        for col in card_columns:
+            row_vals[col] = format_quik_value(col, rec.get(col, ""))
+
+        c.setFont(font, body_font_size)
+        x = margin
+        for col, w in zip(table_columns, col_widths):
+            val = row_vals.get(col, "")
+            val = _fit_text(val, font, body_font_size, w - 4, c)
+            c.drawString(x + 2, page_y - body_font_size, val)
+            x += w
+
+        page_y -= row_h
+        rows_on_page += 1
+
+        if progress_cb and row_num % 5000 == 0:
+            progress_cb(row_num)
+
+    c.showPage()
+    c.save()
 
 
 # ============================================================
@@ -758,7 +877,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("QUIK XML → отчёт (HTML / PDF)")
-        self.geometry("720x420")
+        self.geometry("820x560")
         self.resizable(False, False)
 
         self.xml_path = tk.StringVar()
@@ -766,6 +885,8 @@ class App(tk.Tk):
         self.view_mode = tk.StringVar(value="cards")
 
         self.cancel_flag = threading.Event()
+        self._start_time = None
+        self._end_time = None
 
         self._build_ui()
 
@@ -795,6 +916,26 @@ class App(tk.Tk):
                             variable=self.format_var).pack(
                 side="left", padx=16, pady=8)
 
+        # ─── Блок времени ───
+        frame_time = ttk.LabelFrame(self, text="Время")
+        frame_time.pack(fill="x", **pad)
+
+        ttk.Label(frame_time, text="Начало:").grid(
+            row=0, column=0, sticky="w", padx=6, pady=3)
+        self.lbl_start = ttk.Label(frame_time, text="—")
+        self.lbl_start.grid(row=0, column=1, sticky="w", padx=6, pady=3)
+
+        ttk.Label(frame_time, text="Конец:").grid(
+            row=1, column=0, sticky="w", padx=6, pady=3)
+        self.lbl_end = ttk.Label(frame_time, text="—")
+        self.lbl_end.grid(row=1, column=1, sticky="w", padx=6, pady=3)
+
+        ttk.Label(frame_time, text="Прошло:").grid(
+            row=2, column=0, sticky="w", padx=6, pady=3)
+        self.lbl_elapsed = ttk.Label(frame_time, text="—")
+        self.lbl_elapsed.grid(row=2, column=1, sticky="w", padx=6, pady=3)
+
+        # Прогресс
         frame_prog = ttk.LabelFrame(self, text="Прогресс")
         frame_prog.pack(fill="x", **pad)
         self.progress = ttk.Progressbar(frame_prog, mode="indeterminate")
@@ -811,6 +952,16 @@ class App(tk.Tk):
 
         self.status = ttk.Label(self, text="Готов к работе", foreground="gray")
         self.status.pack(pady=6)
+
+        # Таймер, который обновляет «прошло» каждые 500 мс
+        self._tick()
+
+    def _tick(self):
+        """Периодически обновляет поле «Прошло»."""
+        if self._start_time is not None and self._end_time is None:
+            elapsed = time.time() - self._start_time
+            self.lbl_elapsed.config(text=fmt_duration(elapsed))
+        self.after(500, self._tick)
 
     def choose_file(self):
         path = filedialog.askopenfilename(
@@ -857,6 +1008,15 @@ class App(tk.Tk):
         if not out_path:
             return
 
+        # Сброс и запуск таймеров
+        self._start_time = time.time()
+        self._end_time = None
+
+        started_at = datetime.now()
+        self.lbl_start.config(text=started_at.strftime('%d.%m.%Y %H:%M:%S'))
+        self.lbl_end.config(text="—")
+        self.lbl_elapsed.config(text="—")
+
         self.cancel_flag.clear()
         self.btn_convert.config(state="disabled")
         self.btn_cancel.config(state="normal")
@@ -885,28 +1045,60 @@ class App(tk.Tk):
                     f"Namespace: {namespace or '—'}. Разбор транзакций…",
                     "blue")
 
+                # Важно: время конца фиксируем ДО экспорта,
+                # чтобы в отчёт попали актуальные метки. Обновим после.
+                # На самом деле фиксируем сейчас и потом ещё раз в finally.
+                finished_at_for_report = datetime.now()
+
                 if fmt == "html":
                     export_html(clean_path, out_path, RECORD_TAG,
                                 namespace=namespace, config=config,
                                 limit=DEFAULT_LIMIT,
                                 progress_cb=self._progress_cb,
                                 cancel_flag=self.cancel_flag,
-                                as_cards=as_cards)
+                                as_cards=as_cards,
+                                started_at=started_at,
+                                finished_at=finished_at_for_report)
                 elif fmt == "pdf":
                     export_pdf(clean_path, out_path, RECORD_TAG,
                                namespace=namespace, config=config,
                                limit=DEFAULT_LIMIT,
                                progress_cb=self._progress_cb,
                                cancel_flag=self.cancel_flag,
-                               as_cards=as_cards)
+                               as_cards=as_cards,
+                               started_at=started_at,
+                               finished_at=finished_at_for_report)
                 else:
                     raise ValueError(f"Неизвестный формат: {fmt}")
 
+                # Точный конец — уже после завершения записи файла
+                self._end_time = time.time()
+                end_dt = datetime.now()
+                total = self._end_time - self._start_time
+
+                def apply_end():
+                    self.lbl_end.config(
+                        text=end_dt.strftime('%d.%m.%Y %H:%M:%S'))
+                    self.lbl_elapsed.config(text=fmt_duration(total))
+
+                self.after(0, apply_end)
+
                 self.after(0, self._show_success,
-                           f"Файл сохранён:\n{out_path}")
+                           f"Файл сохранён:\n{out_path}\n\n"
+                           f"Всего: {fmt_duration(total)}")
 
             except Exception as exc:
                 err = f"{type(exc).__name__}: {exc}"
+                self._end_time = time.time()
+                end_dt = datetime.now()
+                total = self._end_time - self._start_time
+
+                def apply_end_err():
+                    self.lbl_end.config(
+                        text=end_dt.strftime('%d.%m.%Y %H:%M:%S'))
+                    self.lbl_elapsed.config(text=fmt_duration(total))
+
+                self.after(0, apply_end_err)
                 self.after(0, self._show_error, "Ошибка", err)
 
             finally:
