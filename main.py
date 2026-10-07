@@ -35,14 +35,14 @@ DEFAULT_LIMIT = 1000000
 
 EMPTY_MARK = "-"
 
-# Синтетический ключ для порядкового номера записи («Заявка»)
+# Синтетическая колонка «Запись» — порядковый номер строки в таблице
 RECORD_NUM_COL = "__record_num__"
 
 QUIK_FIELD_LABELS = {
-    # Синтетические колонки — вычисляются при экспорте
-    RECORD_NUM_COL: "Заявка",
+    # Синтетическая колонка «Запись» (номер строки)
+    RECORD_NUM_COL: "Запись",
 
-    # Атрибуты Trans — как было в исходном варианте
+    # Атрибуты Trans
     "@TransNum":   "№ транзакции",
     "@UID":        "UID",
     "@TransID":    "ID транзакции",
@@ -321,29 +321,34 @@ def extract_records(path, record_tag=RECORD_TAG, namespace=None,
 # ============================================================
 
 def inject_record_numbers(records):
-    """Добавляет каждому rec порядковый номер (1, 2, 3, ...)."""
+    """Проставляет порядковый номер (1, 2, 3, ...) каждой записи."""
     for i, rec in enumerate(records, 1):
         rec[RECORD_NUM_COL] = str(i)
 
 
 def build_card_columns(records, descriptions=None):
     """
-    Набор колонок для карточек и таблицы.
-    «Заявка» (порядковый номер) всегда первая.
+    Набор колонок для КАРТОЧЕК — все ключи, встречающиеся хотя бы в одной
+    записи (в порядке первого появления). Синтетическая колонка «Запись»
+    в карточках не используется.
     """
     seen = {}
     for rec in records:
         for k in rec:
+            if k == RECORD_NUM_COL:
+                continue
             if k not in seen:
                 seen[k] = True
     columns = list(seen.keys())
-
-    if RECORD_NUM_COL in columns:
-        columns = [RECORD_NUM_COL] + [c for c in columns
-                                      if c != RECORD_NUM_COL]
-
     header_map = {c: label_for(c, descriptions) for c in columns}
     return columns, header_map
+
+
+def build_table_columns(card_columns):
+    """
+    Колонки для ТАБЛИЦЫ = «Запись» (номер строки) + все колонки из карточек.
+    """
+    return [RECORD_NUM_COL] + list(card_columns)
 
 
 # ============================================================
@@ -396,6 +401,11 @@ def export_html(xml_path, out_path, record_tag=RECORD_TAG, namespace=None,
 
     card_columns, card_header_map = build_card_columns(records, descriptions)
 
+    # Таблица: «Запись» + все колонки из карточек
+    table_columns = build_table_columns(card_columns)
+    table_header_map = {RECORD_NUM_COL: "Запись"}
+    table_header_map.update(card_header_map)
+
     meta_lines = [
         f"Дата формирования: {datetime.now().strftime('%d.%m.%Y %H:%M')}",
     ]
@@ -426,12 +436,12 @@ def export_html(xml_path, out_path, record_tag=RECORD_TAG, namespace=None,
                 f.write("</div>\n")
         else:
             f.write("<table><thead><tr>")
-            for col in card_columns:
-                f.write(f"<th>{_esc(card_header_map[col])}</th>")
+            for col in table_columns:
+                f.write(f"<th>{_esc(table_header_map[col])}</th>")
             f.write("</tr></thead><tbody>\n")
             for rec in records:
                 f.write("<tr>")
-                for col in card_columns:
+                for col in table_columns:
                     cls = ("num"
                            if base_field_name(col) in QUIK_NUMERIC_FIELDS
                            else "")
@@ -484,9 +494,19 @@ def export_pdf(xml_path, out_path, record_tag=RECORD_TAG, namespace=None,
 
     card_columns, card_header_map = build_card_columns(records, descriptions)
 
-    ncols = len(card_columns)
+    # Таблица: «Запись» + все колонки из карточек
+    table_columns = build_table_columns(card_columns)
+    table_header_map = {RECORD_NUM_COL: "Запись"}
+    table_header_map.update(card_header_map)
 
-    # ---- Подбор формата страницы по числу колонок ----
+    # Для подбора формата страницы в таблице считаем с «Записью»
+    ncols_table = len(table_columns)
+    ncols_cards = len(card_columns)
+
+    # ---- Подбор формата страницы ----
+    # Для карточек ориентируемся на их число полей, для таблицы — на ncols_table
+    ncols = ncols_table if not as_cards else ncols_cards
+
     if as_cards or ncols <= 6:
         pagesize = A4
         body_font_size = 9
@@ -551,16 +571,16 @@ def export_pdf(xml_path, out_path, record_tag=RECORD_TAG, namespace=None,
         return
 
     # ---------- ТАБЛИЦА ----------
-    data = [[Paragraph(f"<b>{_esc(card_header_map[c])}</b>", normal)
-             for c in card_columns]]
+    data = [[Paragraph(f"<b>{_esc(table_header_map[c])}</b>", normal)
+             for c in table_columns]]
     for rec in records:
         data.append([
             Paragraph(_esc(format_quik_value(c, rec.get(c, ""))), normal)
-            for c in card_columns
+            for c in table_columns
         ])
 
-    avail = (pagesize[0] - 2.0 * cm) / max(len(card_columns), 1)
-    col_widths = [avail] * len(card_columns)
+    avail = (pagesize[0] - 2.0 * cm) / max(len(table_columns), 1)
+    col_widths = [avail] * len(table_columns)
 
     tbl = Table(data, colWidths=col_widths, repeatRows=1)
     tbl.setStyle(TableStyle([
@@ -599,6 +619,7 @@ class App(tk.Tk):
     def _build_ui(self):
         pad = {"padx": 10, "pady": 8}
 
+        # 1. Файл
         frame_file = ttk.LabelFrame(self, text="1. XML-файл QUIK")
         frame_file.pack(fill="x", **pad)
         ttk.Entry(frame_file, textvariable=self.xml_path, width=70).pack(
@@ -606,6 +627,7 @@ class App(tk.Tk):
         ttk.Button(frame_file, text="Обзор…", command=self.choose_file).pack(
             side="right", padx=6, pady=6)
 
+        # 2. Представление
         frame_view = ttk.LabelFrame(self, text="2. Представление")
         frame_view.pack(fill="x", **pad)
         ttk.Radiobutton(frame_view, text="Карточки",
@@ -615,6 +637,7 @@ class App(tk.Tk):
                         value="table", variable=self.view_mode).pack(
             side="left", padx=16, pady=8)
 
+        # 3. Формат вывода
         frame_fmt = ttk.LabelFrame(self, text="3. Формат вывода")
         frame_fmt.pack(fill="x", **pad)
         for fmt, label in [("html", "HTML"), ("pdf", "PDF")]:
@@ -622,11 +645,13 @@ class App(tk.Tk):
                             variable=self.format_var).pack(
                 side="left", padx=16, pady=8)
 
+        # Прогресс
         frame_prog = ttk.LabelFrame(self, text="Прогресс")
         frame_prog.pack(fill="x", **pad)
         self.progress = ttk.Progressbar(frame_prog, mode="indeterminate")
         self.progress.pack(fill="x", padx=6, pady=8)
 
+        # Кнопки
         frame_btn = ttk.Frame(self)
         frame_btn.pack(fill="x", **pad)
         self.btn_convert = ttk.Button(frame_btn, text="Сформировать отчёт",
