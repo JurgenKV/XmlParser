@@ -7,7 +7,7 @@ from tkinter import ttk, filedialog, messagebox
 
 from lxml import etree as ET
 
-from reportlab.lib.pagesizes import A4, landscape
+from reportlab.lib.pagesizes import A4, landscape, A3, A2, A1, A0
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import cm
 from reportlab.lib import colors
@@ -468,12 +468,6 @@ def export_pdf(xml_path, out_path, record_tag=RECORD_TAG, namespace=None,
     font = register_cyrillic_font()
 
     styles = getSampleStyleSheet()
-    h1 = ParagraphStyle("H1", parent=styles["Heading1"], fontName=font,
-                        fontSize=16, leading=20)
-    normal = ParagraphStyle("N", parent=styles["Normal"], fontName=font,
-                            fontSize=9, leading=12)
-    small = ParagraphStyle("S", parent=styles["Normal"], fontName=font,
-                           fontSize=8, leading=10, textColor=colors.grey)
 
     header = read_report_header(xml_path)
 
@@ -485,16 +479,38 @@ def export_pdf(xml_path, out_path, record_tag=RECORD_TAG, namespace=None,
         max_records=limit))
 
     card_columns, card_header_map = build_card_columns(records, descriptions)
-    table_columns = build_table_columns(records)
-    table_header_map = {c: label_for(c, descriptions) for c in table_columns}
 
-    use_landscape = len(table_columns) > 5 if not as_cards else False
-    pagesize = landscape(A4) if use_landscape else A4
+    ncols = len(card_columns)
+
+    # ---- Подбор формата страницы по числу колонок ----
+    if as_cards or ncols <= 6:
+        pagesize = A4                          # 297 × 210 мм (landscape)
+        body_font_size = 9
+    elif ncols <= 10:
+        pagesize = landscape(A3)               # 420 × 297 мм
+        body_font_size = 8
+    elif ncols <= 16:
+        pagesize = landscape(A2)               # 594 × 420 мм
+        body_font_size = 8
+    elif ncols <= 24:
+        pagesize = landscape(A1)               # 841 × 594 мм
+        body_font_size = 7
+    else:
+        pagesize = landscape(A0)               # 1189 × 841 мм
+        body_font_size = 7
+
+    h1 = ParagraphStyle("H1", parent=styles["Heading1"], fontName=font,
+                        fontSize=16, leading=20)
+    normal = ParagraphStyle("N", parent=styles["Normal"], fontName=font,
+                            fontSize=body_font_size,
+                            leading=body_font_size + 2)
+    small = ParagraphStyle("S", parent=styles["Normal"], fontName=font,
+                           fontSize=8, leading=10, textColor=colors.grey)
 
     doc = SimpleDocTemplate(
         out_path, pagesize=pagesize,
-        leftMargin=1.2 * cm, rightMargin=1.2 * cm,
-        topMargin=1.2 * cm, bottomMargin=1.2 * cm,
+        leftMargin=1.0 * cm, rightMargin=1.0 * cm,
+        topMargin=1.0 * cm, bottomMargin=1.0 * cm,
     )
 
     story = []
@@ -516,6 +532,7 @@ def export_pdf(xml_path, out_path, record_tag=RECORD_TAG, namespace=None,
         story.append(Paragraph(_esc(line), small))
     story.append(Spacer(1, 8))
 
+    # ---------- КАРТОЧКИ ----------
     if as_cards:
         for i, rec in enumerate(records, 1):
             story.append(Paragraph(f"<b>Запись {i}</b>", normal))
@@ -526,29 +543,32 @@ def export_pdf(xml_path, out_path, record_tag=RECORD_TAG, namespace=None,
                     f"<b>{_esc(card_header_map[col])}:</b> "
                     f"{_esc(format_quik_value(col, rec[col]))}", normal))
             story.append(Spacer(1, 6))
-    else:
-        data = [[Paragraph(f"<b>{_esc(table_header_map[c])}</b>", normal)
-                 for c in table_columns]]
-        for rec in records:
-            data.append([
-                Paragraph(_esc(format_quik_value(c, rec.get(c, ""))), normal)
-                for c in table_columns
-            ])
+        doc.build(story)
+        return
 
-        avail = (pagesize[0] - 2.4 * cm) / max(len(table_columns), 1)
-        col_widths = [avail] * len(table_columns)
+    # ---------- ТАБЛИЦА ----------
+    data = [[Paragraph(f"<b>{_esc(card_header_map[c])}</b>", normal)
+             for c in card_columns]]
+    for rec in records:
+        data.append([
+            Paragraph(_esc(format_quik_value(c, rec.get(c, ""))), normal)
+            for c in card_columns
+        ])
 
-        tbl = Table(data, colWidths=col_widths, repeatRows=1)
-        tbl.setStyle(TableStyle([
-            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#f0f4f8")),
-            ("GRID", (0, 0), (-1, -1), 0.4, colors.grey),
-            ("VALIGN", (0, 0), (-1, -1), "TOP"),
-            ("LEFTPADDING", (0, 0), (-1, -1), 4),
-            ("RIGHTPADDING", (0, 0), (-1, -1), 4),
-            ("TOPPADDING", (0, 0), (-1, -1), 3),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
-        ]))
-        story.append(tbl)
+    avail = (pagesize[0] - 2.0 * cm) / max(len(card_columns), 1)
+    col_widths = [avail] * len(card_columns)
+
+    tbl = Table(data, colWidths=col_widths, repeatRows=1)
+    tbl.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#f0f4f8")),
+        ("GRID", (0, 0), (-1, -1), 0.4, colors.grey),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 3),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 3),
+        ("TOPPADDING", (0, 0), (-1, -1), 2),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+    ]))
+    story.append(tbl)
 
     doc.build(story)
 
