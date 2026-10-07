@@ -35,12 +35,15 @@ DEFAULT_LIMIT = 1000000
 
 EMPTY_MARK = "-"
 
-# Заявка — первая колонка в отчёте
-FIRST_COLUMN = "@TransNum"
-FIRST_COLUMN_LABEL = "Заявка"
+# Синтетический ключ для порядкового номера записи («Заявка»)
+RECORD_NUM_COL = "__record_num__"
 
 QUIK_FIELD_LABELS = {
-    "@TransNum":   "Заявка",
+    # Синтетические колонки — вычисляются при экспорте
+    RECORD_NUM_COL: "Заявка",
+
+    # Атрибуты Trans — как было в исходном варианте
+    "@TransNum":   "№ транзакции",
     "@UID":        "UID",
     "@TransID":    "ID транзакции",
     "@SessionID":  "ID сессии",
@@ -233,7 +236,7 @@ def extract_records(path, record_tag=RECORD_TAG, namespace=None,
 
             rec = {}
 
-            # 1. Атрибуты Trans (TransNum идёт первым — он первый в XML)
+            # 1. Атрибуты Trans
             for k, v in elem.attrib.items():
                 rec[f"@{strip_ns(k)}"] = v
 
@@ -317,11 +320,16 @@ def extract_records(path, record_tag=RECORD_TAG, namespace=None,
 # 4. КОЛОНКИ
 # ============================================================
 
+def inject_record_numbers(records):
+    """Добавляет каждому rec порядковый номер (1, 2, 3, ...)."""
+    for i, rec in enumerate(records, 1):
+        rec[RECORD_NUM_COL] = str(i)
+
+
 def build_card_columns(records, descriptions=None):
     """
-    Набор колонок для карточек и таблицы — все ключи, встречающиеся
-    хотя бы в одной записи (в порядке первого появления).
-    Заявка (@TransNum) всегда выносится первой.
+    Набор колонок для карточек и таблицы.
+    «Заявка» (порядковый номер) всегда первая.
     """
     seen = {}
     for rec in records:
@@ -330,9 +338,9 @@ def build_card_columns(records, descriptions=None):
                 seen[k] = True
     columns = list(seen.keys())
 
-    # Заявка — всегда первая
-    if FIRST_COLUMN in columns:
-        columns = [FIRST_COLUMN] + [c for c in columns if c != FIRST_COLUMN]
+    if RECORD_NUM_COL in columns:
+        columns = [RECORD_NUM_COL] + [c for c in columns
+                                      if c != RECORD_NUM_COL]
 
     header_map = {c: label_for(c, descriptions) for c in columns}
     return columns, header_map
@@ -383,6 +391,8 @@ def export_html(xml_path, out_path, record_tag=RECORD_TAG, namespace=None,
         config=config, descriptions=descriptions,
         progress_cb=progress_cb, cancel_flag=cancel_flag,
         max_records=limit))
+
+    inject_record_numbers(records)
 
     card_columns, card_header_map = build_card_columns(records, descriptions)
 
@@ -469,6 +479,8 @@ def export_pdf(xml_path, out_path, record_tag=RECORD_TAG, namespace=None,
         config=config, descriptions=descriptions,
         progress_cb=progress_cb, cancel_flag=cancel_flag,
         max_records=limit))
+
+    inject_record_numbers(records)
 
     card_columns, card_header_map = build_card_columns(records, descriptions)
 
