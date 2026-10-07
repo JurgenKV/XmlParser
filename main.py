@@ -37,13 +37,17 @@ DEFAULT_LIMIT = 1000000
 
 EMPTY_MARK = "-"
 RECORD_NUM_COL = "__record_num__"
+TRADE_DATE_ATTR = "@TradeDate"
 
 CLEAN_CHUNK = 4 * 1024 * 1024
 QUEUE_DEPTH = 4
 
-# Порог длины значения, до которого считаем "влезет в одну строку"
-# (быстрая эвристика — если символов меньше, не измеряем ширину)
 FAST_LEN_THRESHOLD = 20
+
+RU_MONTHS = [
+    "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
+    "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь",
+]
 
 QUIK_FIELD_LABELS = {
     RECORD_NUM_COL: "Запись",
@@ -79,11 +83,10 @@ QUIK_NUMERIC_FIELDS = {
 
 
 # ============================================================
-# 0.1. ФОРМАТИРОВАНИЕ ВРЕМЕНИ
+# 0.1. ФОРМАТИРОВАНИЕ ВРЕМЕНИ И МЕСЯЦЕВ
 # ============================================================
 
 def fmt_duration(seconds):
-    """Секунды → '1 ч 23 мин 45 с' (или '12 с')."""
     seconds = int(seconds)
     h = seconds // 3600
     m = (seconds % 3600) // 60
@@ -95,6 +98,33 @@ def fmt_duration(seconds):
         parts.append(f"{m} мин")
     parts.append(f"{s} с")
     return " ".join(parts)
+
+
+def extract_month_key(rec):
+    """(sort_key, label) по @TradeDate. Пример: ('2019-06','2019_Июнь')."""
+    d = (rec.get(TRADE_DATE_ATTR) or "").strip()
+
+    if len(d) == 10 and d[4] == "-" and d[7] == "-":
+        try:
+            y = int(d[0:4])
+            m = int(d[5:7])
+            if 1 <= m <= 12:
+                return (f"{y:04d}-{m:02d}",
+                        f"{y:04d}_{RU_MONTHS[m - 1]}")
+        except ValueError:
+            pass
+
+    if len(d) == 8 and d.isdigit():
+        try:
+            y = int(d[0:4])
+            m = int(d[4:6])
+            if 1 <= m <= 12:
+                return (f"{y:04d}-{m:02d}",
+                        f"{y:04d}_{RU_MONTHS[m - 1]}")
+        except ValueError:
+            pass
+
+    return ("0000-00", "0000_БезДаты")
 
 
 # ============================================================
@@ -485,19 +515,8 @@ def extract_records(path, record_tag=RECORD_TAG, namespace=None,
 # 4. КОЛОНКИ
 # ============================================================
 
-def inject_record_numbers(records):
-    for i, rec in enumerate(records, 1):
-        rec[RECORD_NUM_COL] = str(i)
-
-
-def build_card_columns(records, descriptions=None):
-    seen = {}
-    for rec in records:
-        for k in rec:
-            if k == RECORD_NUM_COL:
-                continue
-            if k not in seen:
-                seen[k] = True
+def build_columns_from_seen(seen, descriptions=None):
+    """Строит columns и header_map из множества ключей seen."""
     columns = list(seen.keys())
     header_map = {c: label_for(c, descriptions) for c in columns}
     return columns, header_map
@@ -508,7 +527,7 @@ def build_table_columns(card_columns):
 
 
 # ============================================================
-# 5. HTML
+# 5. HTML (один месяц)
 # ============================================================
 
 HTML_HEAD = """<!DOCTYPE html>
@@ -541,22 +560,14 @@ def _esc(s):
     return html.escape(str(s))
 
 
-def export_html(clean_xml_path, out_path, record_tag=RECORD_TAG,
-                namespace=None, config=None, limit=DEFAULT_LIMIT,
-                progress_cb=None, cancel_flag=None, as_cards=False,
-                started_at=None, finished_at=None):
-    header = read_report_header(clean_xml_path)
-
-    descriptions = {}
-    records = list(extract_records(
-        clean_xml_path, record_tag, namespace,
-        config=config, descriptions=descriptions,
-        progress_cb=progress_cb, cancel_flag=cancel_flag,
-        max_records=limit))
-
-    inject_record_numbers(records)
-
-    card_columns, card_header_map = build_card_columns(records, descriptions)
+def export_html_month(out_path, month_label, records_iter,
+                      card_columns, card_header_map,
+                      header, started_at, finished_at,
+                      as_cards, progress_cb=None, cancel_flag=None):
+    """
+    Пишет HTML для одного месяца, потоково читая records_iter.
+    records_iter — генератор записей ТОЛЬКО этого месяца.
+    """
     table_columns = build_table_columns(card_columns)
     table_header_map = {RECORD_NUM_COL: "Запись"}
     table_header_map.update(card_header_map)
@@ -566,31 +577,64 @@ def export_html(clean_xml_path, out_path, record_tag=RECORD_TAG,
     finished_at = finished_at or now
     duration_sec = (finished_at - started_at).total_seconds()
 
-    meta_lines = [
-        f"Дата формирования: {now.strftime('%d.%m.%Y %H:%M:%S')}",
-        f"Начало обработки: {started_at.strftime('%d.%m.%Y %H:%M:%S')}",
-        f"Конец обработки: {finished_at.strftime('%d.%m.%Y %H:%M:%S')}",
-        f"Затрачено времени: {fmt_duration(duration_sec)}",
-    ]
-    if header.get("StartDate") or header.get("EndDate"):
-        s = format_date_string(header.get("StartDate", ""))
-        e = format_date_string(header.get("EndDate", ""))
-        meta_lines.append(f"Период: {s} — {e}")
-    if header.get("ProgramVersion"):
-        meta_lines.append(f"Версия QUIK: {header['ProgramVersion']}")
-    meta_lines.append(f"Источник: {os.path.basename(clean_xml_path)}")
-    meta_lines.append(f"Записей: {len(records)}")
+    title = f"Отчёт по транзакциям QUIK — {month_label}"
+
+    # Количество записей заранее неизвестно — соберём во время записи
+    count = 0
 
     with open(out_path, "w", encoding="utf-8",
               buffering=1024 * 1024) as f:
-        f.write(HTML_HEAD.format(
-            title="Отчёт по транзакциям QUIK",
-            meta="<br>".join(_esc(m) for m in meta_lines),
-        ))
+        # Шапку пишем сразу, но с плейсхолдером количества
+        f.write("""<!DOCTYPE html>
+<html lang="ru"><head><meta charset="utf-8">
+<title>{title}</title>
+<style>
+  body {{ font-family: -apple-system, Segoe UI, Arial, sans-serif;
+         margin: 2em; color: #222; }}
+  h1 {{ border-bottom: 2px solid #444; padding-bottom: .3em; }}
+  .meta {{ color: #555; font-size: 13px; margin-bottom: 1em; }}
+  table {{ border-collapse: collapse; margin: 1em 0; width: 100%;
+           font-size: 13px; }}
+  th, td {{ border: 1px solid #ccc; padding: 6px 10px; text-align: left;
+            vertical-align: top; }}
+  th {{ background: #f0f4f8; position: sticky; top: 0; }}
+  tr:nth-child(even) {{ background: #fafbfc; }}
+  td.num {{ text-align: right; font-variant-numeric: tabular-nums; }}
+  .card {{ border: 1px solid #ddd; border-radius: 6px; padding: 12px 16px;
+           margin: 8px 0; background: #fafbfc; }}
+  .card h3 {{ margin-top: 0; color: #004a99; }}
+  .field {{ margin: 2px 0; }}
+  .field b {{ color: #333; }}
+</style></head><body>
+""".format(title=_esc(title)))
+
+        f.write(f"<h1>{_esc(title)}</h1>\n")
+        f.write('<div class="meta">')
+
+        meta_lines = [
+            f"Дата формирования: {now.strftime('%d.%m.%Y %H:%M:%S')}",
+            f"Начало обработки: {started_at.strftime('%d.%m.%Y %H:%M:%S')}",
+            f"Конец обработки: {finished_at.strftime('%d.%m.%Y %H:%M:%S')}",
+            f"Затрачено времени: {fmt_duration(duration_sec)}",
+            f"Месяц: {month_label}",
+        ]
+        if header.get("StartDate") or header.get("EndDate"):
+            s = format_date_string(header.get("StartDate", ""))
+            e = format_date_string(header.get("EndDate", ""))
+            meta_lines.append(f"Период (из XML): {s} — {e}")
+        if header.get("ProgramVersion"):
+            meta_lines.append(
+                f"Версия QUIK: {header['ProgramVersion']}")
+
+        f.write("<br>".join(_esc(m) for m in meta_lines))
+        f.write("</div>\n")
 
         if as_cards:
-            for i, rec in enumerate(records, 1):
-                f.write(f'<div class="card"><h3>Запись {i}</h3>\n')
+            for rec in records_iter:
+                if cancel_flag and cancel_flag.is_set():
+                    break
+                count += 1
+                f.write(f'<div class="card"><h3>Запись {count}</h3>\n')
                 for col in card_columns:
                     if col not in rec:
                         continue
@@ -598,14 +642,20 @@ def export_html(clean_xml_path, out_path, record_tag=RECORD_TAG,
                         f'<div class="field"><b>{_esc(card_header_map[col])}:</b> '
                         f'{_esc(format_quik_value(col, rec[col]))}</div>\n')
                 f.write("</div>\n")
+                if progress_cb and count % 5000 == 0:
+                    progress_cb(count)
         else:
             f.write("<table><thead><tr>")
             for col in table_columns:
                 f.write(f"<th>{_esc(table_header_map[col])}</th>")
             f.write("</tr></thead><tbody>\n")
-            for rec in records:
+            for rec in records_iter:
+                if cancel_flag and cancel_flag.is_set():
+                    break
+                count += 1
                 f.write("<tr>")
-                for col in table_columns:
+                f.write(f'<td>{count}</td>')
+                for col in card_columns:
                     cls = ("num"
                            if base_field_name(col) in QUIK_NUMERIC_FIELDS
                            else "")
@@ -613,13 +663,17 @@ def export_html(clean_xml_path, out_path, record_tag=RECORD_TAG,
                         f'<td class="{cls}">'
                         f'{_esc(format_quik_value(col, rec.get(col, "")))}</td>')
                 f.write("</tr>\n")
+                if progress_cb and count % 5000 == 0:
+                    progress_cb(count)
             f.write("</tbody></table>\n")
 
         f.write("</body></html>\n")
 
+    return count
+
 
 # ============================================================
-# 6. PDF через Canvas
+# 6. PDF (один месяц) через Canvas
 # ============================================================
 
 def register_cyrillic_font():
@@ -639,28 +693,20 @@ def register_cyrillic_font():
 
 
 def _wrap_text(text, font_name, font_size, max_width):
-    """
-    Разбивает текст на строки по ширине.
-    Быстрая эвристика: короткий ASCII-текст сразу считается помещающимся.
-    """
     if not text:
         return [""]
     text = str(text)
     if not text:
         return [""]
 
-    # Быстрая проверка: если текст короткий и весь ASCII —
-    # почти наверняка влезет в строку (для большинства шрифтов).
     if len(text) <= FAST_LEN_THRESHOLD and text.isascii():
         return [text]
 
     if stringWidth(text, font_name, font_size) <= max_width:
         return [text]
 
-    # simpleSplit разбивает по словам (пробелы)
     lines = simpleSplit(text, font_name, font_size, max_width)
 
-    # Если какое-то слово само шире ячейки — дробим посимвольно
     result = []
     for line in lines:
         if stringWidth(line, font_name, font_size) <= max_width:
@@ -684,10 +730,6 @@ def _wrap_text(text, font_name, font_size, max_width):
 
 def _calc_row_height(row_values, table_columns, col_widths,
                      font_name, font_size, line_h):
-    """
-    Считает высоту строки таблицы: максимум по числу строк в ячейках.
-    Возвращает (height, {col: [lines]}).
-    """
     wrapped = {}
     max_lines = 1
 
@@ -701,30 +743,16 @@ def _calc_row_height(row_values, table_columns, col_widths,
     return max_lines * line_h, wrapped
 
 
-def export_pdf(clean_xml_path, out_path, record_tag=RECORD_TAG,
-               namespace=None, config=None, limit=DEFAULT_LIMIT,
-               progress_cb=None, cancel_flag=None, as_cards=False,
-               started_at=None, finished_at=None):
+def export_pdf_month(out_path, month_label, records_iter,
+                     card_columns, card_header_map,
+                     header, started_at, finished_at,
+                     as_cards, progress_cb=None, cancel_flag=None):
+    """
+    Пишет PDF для одного месяца, потоково читая records_iter.
+    Возвращает количество записей.
+    """
     font = register_cyrillic_font()
 
-    header = read_report_header(clean_xml_path)
-
-    # Пробный проход — только для определения колонок
-    descriptions = {}
-    sample = []
-    for i, rec in enumerate(extract_records(
-            clean_xml_path, record_tag, namespace,
-            config=config, descriptions=descriptions,
-            progress_cb=None, cancel_flag=cancel_flag,
-            max_records=200)):
-        sample.append(rec)
-        if cancel_flag and cancel_flag.is_set():
-            return
-
-    if not sample:
-        sample = [{}]
-
-    card_columns, card_header_map = build_card_columns(sample, descriptions)
     table_columns = build_table_columns(card_columns)
     table_header_map = {RECORD_NUM_COL: "Запись"}
     table_header_map.update(card_header_map)
@@ -763,11 +791,12 @@ def export_pdf(clean_xml_path, out_path, record_tag=RECORD_TAG,
 
     header_font_size = body_font_size
     meta_line_h = 10
-    line_h = body_font_size * 1.25     # высота одной текстовой строки в ячейке
-    row_pad = 2                         # воздух между строками
+    line_h = body_font_size * 1.25
+    row_pad = 2
 
     c = rl_canvas.Canvas(out_path, pagesize=pagesize)
-    c.setTitle("Отчёт по транзакциям QUIK")
+    title_text = f"Отчёт по транзакциям QUIK — {month_label}"
+    c.setTitle(title_text)
 
     now = datetime.now()
     started_at = started_at or now
@@ -778,7 +807,7 @@ def export_pdf(clean_xml_path, out_path, record_tag=RECORD_TAG,
         y = page_h - margin
 
         c.setFont(font, 16)
-        c.drawString(margin, y - 16, "Отчёт по транзакциям QUIK")
+        c.drawString(margin, y - 16, title_text)
         y -= 26
 
         if is_first_page:
@@ -791,16 +820,15 @@ def export_pdf(clean_xml_path, out_path, record_tag=RECORD_TAG,
                 f"Конец обработки: "
                 f"{finished_at.strftime('%d.%m.%Y %H:%M:%S')}",
                 f"Затрачено времени: {fmt_duration(duration_sec)}",
+                f"Месяц: {month_label}",
             ]
             if header.get("StartDate") or header.get("EndDate"):
                 s = format_date_string(header.get("StartDate", ""))
                 e = format_date_string(header.get("EndDate", ""))
-                meta_lines.append(f"Период: {s} — {e}")
+                meta_lines.append(f"Период (из XML): {s} — {e}")
             if header.get("ProgramVersion"):
                 meta_lines.append(
                     f"Версия QUIK: {header['ProgramVersion']}")
-            meta_lines.append(
-                f"Источник: {os.path.basename(clean_xml_path)}")
 
             for line in meta_lines:
                 c.drawString(margin, y, line)
@@ -812,7 +840,6 @@ def export_pdf(clean_xml_path, out_path, record_tag=RECORD_TAG,
         return y
 
     def draw_table_header(y):
-        """Заголовки колонок с переносом по ширине ячейки."""
         header_line_h = header_font_size * 1.25
 
         wrapped_headers = {}
@@ -834,7 +861,6 @@ def export_pdf(clean_xml_path, out_path, record_tag=RECORD_TAG,
                 c.drawString(x + 2, y_text, ln)
             x += w
 
-        # Линия под шапкой
         y_line = y - header_h + 2
         c.setLineWidth(0.6)
         c.setStrokeColorRGB(0.3, 0.3, 0.3)
@@ -844,25 +870,20 @@ def export_pdf(clean_xml_path, out_path, record_tag=RECORD_TAG,
 
         return y - header_h
 
+    count = 0
+
     # ────── Карточки ──────
     if as_cards:
         page_y = draw_report_header(True)
-        item_index = 0
         card_line_h = body_font_size * 1.3
 
-        for rec in extract_records(
-                clean_xml_path, record_tag, namespace,
-                config=config, descriptions=descriptions,
-                progress_cb=progress_cb, cancel_flag=cancel_flag,
-                max_records=limit):
+        for rec in records_iter:
             if cancel_flag and cancel_flag.is_set():
                 break
+            count += 1
 
-            item_index += 1
-
-            # Заранее посчитаем, сколько строк займёт карточка
-            card_lines = []  # [(is_title, text)]
-            card_lines.append((True, f"Запись {item_index}"))
+            card_lines = []
+            card_lines.append((True, f"Запись {count}"))
             for col in card_columns:
                 if col not in rec:
                     continue
@@ -882,7 +903,8 @@ def export_pdf(clean_xml_path, out_path, record_tag=RECORD_TAG,
             for is_title, ln in card_lines:
                 if is_title:
                     c.setFont(font, body_font_size + 1)
-                    c.drawString(margin, page_y - body_font_size - 1, ln)
+                    c.drawString(margin,
+                                 page_y - body_font_size - 1, ln)
                     page_y -= card_line_h
                 else:
                     c.setFont(font, body_font_size)
@@ -892,30 +914,23 @@ def export_pdf(clean_xml_path, out_path, record_tag=RECORD_TAG,
 
             page_y -= 4
 
-            if progress_cb and item_index % 5000 == 0:
-                progress_cb(item_index)
+            if progress_cb and count % 5000 == 0:
+                progress_cb(count)
 
         c.showPage()
         c.save()
-        return
+        return count
 
     # ────── Таблица ──────
     page_y = draw_report_header(True)
     page_y = draw_table_header(page_y)
 
-    row_num = 0
-
-    for rec in extract_records(
-            clean_xml_path, record_tag, namespace,
-            config=config, descriptions=descriptions,
-            progress_cb=progress_cb, cancel_flag=cancel_flag,
-            max_records=limit):
+    for rec in records_iter:
         if cancel_flag and cancel_flag.is_set():
             break
+        count += 1
 
-        row_num += 1
-
-        row_vals = {RECORD_NUM_COL: str(row_num)}
+        row_vals = {RECORD_NUM_COL: str(count)}
         for col in card_columns:
             row_vals[col] = format_quik_value(col, rec.get(col, ""))
 
@@ -929,14 +944,12 @@ def export_pdf(clean_xml_path, out_path, record_tag=RECORD_TAG,
             page_y = draw_report_header(False)
             page_y = draw_table_header(page_y)
 
-        # Зебра
-        if row_num % 2 == 0:
+        if count % 2 == 0:
             c.setFillColorRGB(0.97, 0.97, 0.97)
             c.rect(margin, page_y - row_h, usable_w, row_h,
                    stroke=0, fill=1)
             c.setFillColorRGB(0, 0, 0)
 
-        # Отрисовка ячеек (многострочно)
         c.setFont(font, body_font_size)
         x = margin
         for col, w in zip(table_columns, col_widths):
@@ -946,7 +959,6 @@ def export_pdf(clean_xml_path, out_path, record_tag=RECORD_TAG,
                 c.drawString(x + 2, y_text, ln)
             x += w
 
-        # Тонкая линия снизу строки
         c.setStrokeColorRGB(0.85, 0.85, 0.85)
         c.setLineWidth(0.2)
         c.line(margin, page_y - row_h,
@@ -956,21 +968,88 @@ def export_pdf(clean_xml_path, out_path, record_tag=RECORD_TAG,
 
         page_y -= row_h
 
-        if progress_cb and row_num % 5000 == 0:
-            progress_cb(row_num)
+        if progress_cb and count % 5000 == 0:
+            progress_cb(count)
 
     c.showPage()
     c.save()
+    return count
 
 
 # ============================================================
-# 7. GUI
+# 7. ПРОХОД 1: определить месяцы и колонки
+# ============================================================
+
+def scan_months_and_columns(clean_xml_path, namespace, config,
+                            cancel_flag=None, progress_cb=None):
+    """
+    Один быстрый проход по XML, чтобы собрать:
+      - множество месяцев (sort_key → label)
+      - общий набор колонок (seen)
+      - descriptions
+    Ни одна запись не хранится в памяти — только агрегаты.
+    """
+    months = {}     # {ym: label}
+    seen = {}       # {key: True} — порядок первого появления
+    descriptions = {}
+    total = 0
+
+    for rec in extract_records(
+            clean_xml_path, RECORD_TAG, namespace,
+            config=config, descriptions=descriptions,
+            progress_cb=None, cancel_flag=cancel_flag,
+            max_records=DEFAULT_LIMIT):
+        if cancel_flag and cancel_flag.is_set():
+            break
+
+        ym, label = extract_month_key(rec)
+        if ym not in months:
+            months[ym] = label
+
+        for k in rec:
+            if k == RECORD_NUM_COL:
+                continue
+            if k not in seen:
+                seen[k] = True
+
+        total += 1
+        if progress_cb and total % 20000 == 0:
+            progress_cb(total)
+
+    return months, seen, descriptions, total
+
+
+# ============================================================
+# 8. ПРОХОД 2..K+1: построить файл для одного месяца
+# ============================================================
+
+def make_month_records_iter(clean_xml_path, namespace, config,
+                            descriptions, target_ym, cancel_flag):
+    """
+    Генератор записей ТОЛЬКО указанного месяца.
+    Проходит XML от начала до конца, но отдаёт только подходящие.
+    """
+    for rec in extract_records(
+            clean_xml_path, RECORD_TAG, namespace,
+            config=config, descriptions=descriptions,
+            progress_cb=None, cancel_flag=cancel_flag,
+            max_records=DEFAULT_LIMIT):
+        if cancel_flag and cancel_flag.is_set():
+            return
+
+        ym, _ = extract_month_key(rec)
+        if ym == target_ym:
+            yield rec
+
+
+# ============================================================
+# 9. GUI
 # ============================================================
 
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("QUIK XML → отчёт (HTML / PDF)")
+        self.title("QUIK XML → отчёты по месяцам (HTML / PDF)")
         self.geometry("820x560")
         self.resizable(False, False)
 
@@ -1035,7 +1114,7 @@ class App(tk.Tk):
 
         frame_btn = ttk.Frame(self)
         frame_btn.pack(fill="x", **pad)
-        self.btn_convert = ttk.Button(frame_btn, text="Сформировать отчёт",
+        self.btn_convert = ttk.Button(frame_btn, text="Сформировать отчёты",
                                       command=self.convert)
         self.btn_convert.pack(side="left", padx=6)
         self.btn_cancel = ttk.Button(frame_btn, text="Отмена",
@@ -1090,7 +1169,7 @@ class App(tk.Tk):
         config = ExtractConfig()
 
         out_path = filedialog.asksaveasfilename(
-            title="Сохранить как",
+            title="Куда сохранить отчёты (будет создана папка)",
             defaultextension=f".{ext}",
             filetypes=[(f"{ext.upper()} files", f"*.{ext}")],
             initialfile=os.path.splitext(os.path.basename(xml_file))[0]
@@ -1110,7 +1189,7 @@ class App(tk.Tk):
         self.btn_convert.config(state="disabled")
         self.btn_cancel.config(state="normal")
         self.progress.start(10)
-        self._set_status("Формирование отчёта…", "blue")
+        self._set_status("Формирование отчётов…", "blue")
 
         def worker():
             clean_path = None
@@ -1120,6 +1199,7 @@ class App(tk.Tk):
                     prefix="quik_clean_", suffix=".xml", dir=src_dir)
                 os.close(tmp_fd)
 
+                # 1. Очистка XML
                 self._set_status("Очистка XML…", "blue")
                 clean_xml_file(
                     xml_file, clean_path,
@@ -1130,58 +1210,121 @@ class App(tk.Tk):
                     raise RuntimeError("Отменено")
 
                 namespace = detect_namespace(clean_path)
-                self._set_status(
-                    f"Namespace: {namespace or '—'}. Разбор транзакций…",
-                    "blue")
+                header = read_report_header(clean_path)
 
-                finished_at_for_report = datetime.now()
+                # 2. ПРОХОД 1: определить месяцы и колонки
+                self._set_status("Проход 1/…: определение месяцев "
+                                 "и колонок…", "blue")
 
-                if fmt == "html":
-                    export_html(clean_path, out_path, RECORD_TAG,
-                                namespace=namespace, config=config,
-                                limit=DEFAULT_LIMIT,
-                                progress_cb=self._progress_cb,
-                                cancel_flag=self.cancel_flag,
-                                as_cards=as_cards,
-                                started_at=started_at,
-                                finished_at=finished_at_for_report)
-                elif fmt == "pdf":
-                    export_pdf(clean_path, out_path, RECORD_TAG,
-                               namespace=namespace, config=config,
-                               limit=DEFAULT_LIMIT,
-                               progress_cb=self._progress_cb,
-                               cancel_flag=self.cancel_flag,
-                               as_cards=as_cards,
-                               started_at=started_at,
-                               finished_at=finished_at_for_report)
-                else:
-                    raise ValueError(f"Неизвестный формат: {fmt}")
+                months, seen, descriptions, total = \
+                    scan_months_and_columns(
+                        clean_path, namespace, config,
+                        cancel_flag=self.cancel_flag,
+                        progress_cb=self._progress_cb)
+
+                if self.cancel_flag.is_set():
+                    raise RuntimeError("Отменено")
+
+                if not months:
+                    raise RuntimeError(
+                        "В файле не найдено ни одной транзакции.")
+
+                # Колонки (все, встретившиеся в файле)
+                card_columns, card_header_map = build_columns_from_seen(
+                    seen, descriptions)
+
+                # 3. Готовим папку для отчётов
+                out_dir_base = os.path.dirname(os.path.abspath(out_path))
+                base_name = os.path.splitext(
+                    os.path.basename(out_path))[0]
+                reports_dir = os.path.join(out_dir_base,
+                                           f"{base_name}_reports")
+                os.makedirs(reports_dir, exist_ok=True)
+
+                # 4. ПРОХОДЫ 2..K+1: пишем файлы по месяцам
+                months_sorted = sorted(months.keys())
+                K = len(months_sorted)
+                written = []
+
+                for i, ym in enumerate(months_sorted, 1):
+                    if self.cancel_flag.is_set():
+                        break
+
+                    month_label = months[ym]
+                    file_name = f"{base_name}_{month_label}.{ext}"
+                    file_path = os.path.join(reports_dir, file_name)
+
+                    self._set_status(
+                        f"Проход {i + 1}/{K + 1}: месяц {month_label}…",
+                        "blue")
+
+                    # Генератор записей только этого месяца
+                    records_iter = make_month_records_iter(
+                        clean_path, namespace, config,
+                        descriptions, ym, self.cancel_flag)
+
+                    finished_at = datetime.now()
+
+                    if fmt == "html":
+                        count = export_html_month(
+                            file_path, month_label, records_iter,
+                            card_columns, card_header_map,
+                            header, started_at, finished_at,
+                            as_cards=as_cards,
+                            progress_cb=self._progress_cb,
+                            cancel_flag=self.cancel_flag)
+                    else:
+                        count = export_pdf_month(
+                            file_path, month_label, records_iter,
+                            card_columns, card_header_map,
+                            header, started_at, finished_at,
+                            as_cards=as_cards,
+                            progress_cb=self._progress_cb,
+                            cancel_flag=self.cancel_flag)
+
+                    written.append((file_path, count))
 
                 self._end_time = time.time()
                 end_dt = datetime.now()
-                total = self._end_time - self._start_time
+                total_time = self._end_time - self._start_time
 
                 def apply_end():
                     self.lbl_end.config(
                         text=end_dt.strftime('%d.%m.%Y %H:%M:%S'))
-                    self.lbl_elapsed.config(text=fmt_duration(total))
+                    self.lbl_elapsed.config(text=fmt_duration(total_time))
 
                 self.after(0, apply_end)
 
-                self.after(0, self._show_success,
-                           f"Файл сохранён:\n{out_path}\n\n"
-                           f"Всего: {fmt_duration(total)}")
+                if not written:
+                    raise RuntimeError("Отчёты не сформированы (отменено)")
+
+                msg_lines = [
+                    f"Всего записей в XML: {total}",
+                    f"Месяцев: {len(written)}",
+                    f"Папка: {reports_dir}",
+                    "",
+                ]
+                for p, c in written[:15]:
+                    msg_lines.append(
+                        f"  • {os.path.basename(p)} — {c}")
+                if len(written) > 15:
+                    msg_lines.append(
+                        f"  … и ещё {len(written) - 15}")
+                msg_lines.append("")
+                msg_lines.append(f"Всего: {fmt_duration(total_time)}")
+
+                self.after(0, self._show_success, "\n".join(msg_lines))
 
             except Exception as exc:
                 err = f"{type(exc).__name__}: {exc}"
                 self._end_time = time.time()
                 end_dt = datetime.now()
-                total = self._end_time - self._start_time
+                total_time = self._end_time - self._start_time
 
                 def apply_end_err():
                     self.lbl_end.config(
                         text=end_dt.strftime('%d.%m.%Y %H:%M:%S'))
-                    self.lbl_elapsed.config(text=fmt_duration(total))
+                    self.lbl_elapsed.config(text=fmt_duration(total_time))
 
                 self.after(0, apply_end_err)
                 self.after(0, self._show_error, "Ошибка", err)
