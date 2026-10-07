@@ -16,6 +16,8 @@ from reportlab.lib.units import cm
 from reportlab.pdfgen import canvas as rl_canvas
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.pdfbase.pdfmetrics import stringWidth
+from reportlab.lib.utils import simpleSplit
 
 
 # ============================================================
@@ -38,6 +40,10 @@ RECORD_NUM_COL = "__record_num__"
 
 CLEAN_CHUNK = 4 * 1024 * 1024
 QUEUE_DEPTH = 4
+
+# Порог длины значения, до которого считаем "влезет в одну строку"
+# (быстрая эвристика — если символов меньше, не измеряем ширину)
+FAST_LEN_THRESHOLD = 20
 
 QUIK_FIELD_LABELS = {
     RECORD_NUM_COL: "Запись",
@@ -555,7 +561,6 @@ def export_html(clean_xml_path, out_path, record_tag=RECORD_TAG,
     table_header_map = {RECORD_NUM_COL: "Запись"}
     table_header_map.update(card_header_map)
 
-    # Формируем метаданные с датами
     now = datetime.now()
     started_at = started_at or now
     finished_at = finished_at or now
@@ -633,23 +638,67 @@ def register_cyrillic_font():
     return "Helvetica"
 
 
-def _fit_text(text, font_name, font_size, max_width, pdf_canvas):
+def _wrap_text(text, font_name, font_size, max_width):
+    """
+    Разбивает текст на строки по ширине.
+    Быстрая эвристика: короткий ASCII-текст сразу считается помещающимся.
+    """
     if not text:
-        return ""
+        return [""]
     text = str(text)
-    if pdf_canvas.stringWidth(text, font_name, font_size) <= max_width:
-        return text
-    ellipsis = "…"
-    ell_w = pdf_canvas.stringWidth(ellipsis, font_name, font_size)
-    lo, hi = 0, len(text)
-    while lo < hi:
-        mid = (lo + hi + 1) // 2
-        w = pdf_canvas.stringWidth(text[:mid], font_name, font_size)
-        if w + ell_w <= max_width:
-            lo = mid
-        else:
-            hi = mid - 1
-    return text[:lo] + ellipsis
+    if not text:
+        return [""]
+
+    # Быстрая проверка: если текст короткий и весь ASCII —
+    # почти наверняка влезет в строку (для большинства шрифтов).
+    if len(text) <= FAST_LEN_THRESHOLD and text.isascii():
+        return [text]
+
+    if stringWidth(text, font_name, font_size) <= max_width:
+        return [text]
+
+    # simpleSplit разбивает по словам (пробелы)
+    lines = simpleSplit(text, font_name, font_size, max_width)
+
+    # Если какое-то слово само шире ячейки — дробим посимвольно
+    result = []
+    for line in lines:
+        if stringWidth(line, font_name, font_size) <= max_width:
+            result.append(line)
+            continue
+
+        chunk = ""
+        for ch in line:
+            test = chunk + ch
+            if stringWidth(test, font_name, font_size) <= max_width:
+                chunk = test
+            else:
+                if chunk:
+                    result.append(chunk)
+                chunk = ch
+        if chunk:
+            result.append(chunk)
+
+    return result or [""]
+
+
+def _calc_row_height(row_values, table_columns, col_widths,
+                     font_name, font_size, line_h):
+    """
+    Считает высоту строки таблицы: максимум по числу строк в ячейках.
+    Возвращает (height, {col: [lines]}).
+    """
+    wrapped = {}
+    max_lines = 1
+
+    for col, w in zip(table_columns, col_widths):
+        val = row_values.get(col, "")
+        lines = _wrap_text(val, font_name, font_size, w - 4)
+        wrapped[col] = lines
+        if len(lines) > max_lines:
+            max_lines = len(lines)
+
+    return max_lines * line_h, wrapped
 
 
 def export_pdf(clean_xml_path, out_path, record_tag=RECORD_TAG,
@@ -713,9 +762,9 @@ def export_pdf(clean_xml_path, out_path, record_tag=RECORD_TAG,
         col_widths = []
 
     header_font_size = body_font_size
-    header_row_h = header_font_size * 1.8
-    row_h = body_font_size * 1.6
     meta_line_h = 10
+    line_h = body_font_size * 1.25     # высота одной текстовой строки в ячейке
+    row_pad = 2                         # воздух между строками
 
     c = rl_canvas.Canvas(out_path, pagesize=pagesize)
     c.setTitle("Отчёт по транзакциям QUIK")
@@ -763,25 +812,43 @@ def export_pdf(clean_xml_path, out_path, record_tag=RECORD_TAG,
         return y
 
     def draw_table_header(y):
+        """Заголовки колонок с переносом по ширине ячейки."""
+        header_line_h = header_font_size * 1.25
+
+        wrapped_headers = {}
+        max_lines = 1
+        for col, w in zip(table_columns, col_widths):
+            text = table_header_map.get(col, col)
+            lines = _wrap_text(text, font, header_font_size, w - 4)
+            wrapped_headers[col] = lines
+            if len(lines) > max_lines:
+                max_lines = len(lines)
+
+        header_h = max_lines * header_line_h + 4
+
         c.setFont(font, header_font_size)
         x = margin
         for col, w in zip(table_columns, col_widths):
-            text = table_header_map.get(col, col)
-            text = _fit_text(text, font, header_font_size, w - 4, c)
-            c.drawString(x + 2, y - header_font_size, text)
+            for j, ln in enumerate(wrapped_headers[col]):
+                y_text = y - header_font_size - j * header_line_h
+                c.drawString(x + 2, y_text, ln)
             x += w
-        y_line = y - header_row_h + 2
+
+        # Линия под шапкой
+        y_line = y - header_h + 2
         c.setLineWidth(0.6)
         c.setStrokeColorRGB(0.3, 0.3, 0.3)
         c.line(margin, y_line, margin + usable_w, y_line)
         c.setStrokeColorRGB(0, 0, 0)
         c.setLineWidth(0.25)
-        return y - header_row_h
+
+        return y - header_h
 
     # ────── Карточки ──────
     if as_cards:
         page_y = draw_report_header(True)
         item_index = 0
+        card_line_h = body_font_size * 1.3
 
         for rec in extract_records(
                 clean_xml_path, record_tag, namespace,
@@ -792,26 +859,36 @@ def export_pdf(clean_xml_path, out_path, record_tag=RECORD_TAG,
                 break
 
             item_index += 1
-            fields_in_rec = [col for col in card_columns if col in rec]
-            card_h = (len(fields_in_rec) + 1) * row_h + 8
+
+            # Заранее посчитаем, сколько строк займёт карточка
+            card_lines = []  # [(is_title, text)]
+            card_lines.append((True, f"Запись {item_index}"))
+            for col in card_columns:
+                if col not in rec:
+                    continue
+                label = card_header_map.get(col, col)
+                val = format_quik_value(col, rec[col])
+                line = f"{label}: {val}"
+                for ln in _wrap_text(line, font, body_font_size,
+                                     usable_w - 6):
+                    card_lines.append((False, ln))
+
+            card_h = len(card_lines) * card_line_h + 8
 
             if page_y - card_h < margin:
                 c.showPage()
                 page_y = draw_report_header(False)
 
-            c.setFont(font, body_font_size + 1)
-            c.drawString(margin, page_y - body_font_size - 1,
-                         f"Запись {item_index}")
-            page_y -= row_h
-
-            c.setFont(font, body_font_size)
-            for col in fields_in_rec:
-                label = card_header_map.get(col, col)
-                val = format_quik_value(col, rec[col])
-                line = f"{label}: {val}"
-                line = _fit_text(line, font, body_font_size, usable_w, c)
-                c.drawString(margin + 6, page_y - body_font_size, line)
-                page_y -= row_h
+            for is_title, ln in card_lines:
+                if is_title:
+                    c.setFont(font, body_font_size + 1)
+                    c.drawString(margin, page_y - body_font_size - 1, ln)
+                    page_y -= card_line_h
+                else:
+                    c.setFont(font, body_font_size)
+                    c.drawString(margin + 6,
+                                 page_y - body_font_size, ln)
+                    page_y -= card_line_h
 
             page_y -= 4
 
@@ -826,8 +903,6 @@ def export_pdf(clean_xml_path, out_path, record_tag=RECORD_TAG,
     page_y = draw_report_header(True)
     page_y = draw_table_header(page_y)
 
-    rows_on_page = 0
-    max_rows_per_page = max(int((page_y - margin) / row_h), 10)
     row_num = 0
 
     for rec in extract_records(
@@ -840,27 +915,46 @@ def export_pdf(clean_xml_path, out_path, record_tag=RECORD_TAG,
 
         row_num += 1
 
-        if rows_on_page >= max_rows_per_page:
-            c.showPage()
-            page_y = draw_report_header(False)
-            page_y = draw_table_header(page_y)
-            max_rows_per_page = max(int((page_y - margin) / row_h), 10)
-            rows_on_page = 0
-
         row_vals = {RECORD_NUM_COL: str(row_num)}
         for col in card_columns:
             row_vals[col] = format_quik_value(col, rec.get(col, ""))
 
+        row_h, wrapped = _calc_row_height(
+            row_vals, table_columns, col_widths,
+            font, body_font_size, line_h)
+        row_h += row_pad
+
+        if page_y - row_h < margin:
+            c.showPage()
+            page_y = draw_report_header(False)
+            page_y = draw_table_header(page_y)
+
+        # Зебра
+        if row_num % 2 == 0:
+            c.setFillColorRGB(0.97, 0.97, 0.97)
+            c.rect(margin, page_y - row_h, usable_w, row_h,
+                   stroke=0, fill=1)
+            c.setFillColorRGB(0, 0, 0)
+
+        # Отрисовка ячеек (многострочно)
         c.setFont(font, body_font_size)
         x = margin
         for col, w in zip(table_columns, col_widths):
-            val = row_vals.get(col, "")
-            val = _fit_text(val, font, body_font_size, w - 4, c)
-            c.drawString(x + 2, page_y - body_font_size, val)
+            lines = wrapped.get(col, [""])
+            for j, ln in enumerate(lines):
+                y_text = page_y - body_font_size - j * line_h
+                c.drawString(x + 2, y_text, ln)
             x += w
 
+        # Тонкая линия снизу строки
+        c.setStrokeColorRGB(0.85, 0.85, 0.85)
+        c.setLineWidth(0.2)
+        c.line(margin, page_y - row_h,
+               margin + usable_w, page_y - row_h)
+        c.setStrokeColorRGB(0, 0, 0)
+        c.setLineWidth(0.25)
+
         page_y -= row_h
-        rows_on_page += 1
 
         if progress_cb and row_num % 5000 == 0:
             progress_cb(row_num)
@@ -916,7 +1010,6 @@ class App(tk.Tk):
                             variable=self.format_var).pack(
                 side="left", padx=16, pady=8)
 
-        # ─── Блок времени ───
         frame_time = ttk.LabelFrame(self, text="Время")
         frame_time.pack(fill="x", **pad)
 
@@ -935,7 +1028,6 @@ class App(tk.Tk):
         self.lbl_elapsed = ttk.Label(frame_time, text="—")
         self.lbl_elapsed.grid(row=2, column=1, sticky="w", padx=6, pady=3)
 
-        # Прогресс
         frame_prog = ttk.LabelFrame(self, text="Прогресс")
         frame_prog.pack(fill="x", **pad)
         self.progress = ttk.Progressbar(frame_prog, mode="indeterminate")
@@ -953,11 +1045,9 @@ class App(tk.Tk):
         self.status = ttk.Label(self, text="Готов к работе", foreground="gray")
         self.status.pack(pady=6)
 
-        # Таймер, который обновляет «прошло» каждые 500 мс
         self._tick()
 
     def _tick(self):
-        """Периодически обновляет поле «Прошло»."""
         if self._start_time is not None and self._end_time is None:
             elapsed = time.time() - self._start_time
             self.lbl_elapsed.config(text=fmt_duration(elapsed))
@@ -1008,7 +1098,6 @@ class App(tk.Tk):
         if not out_path:
             return
 
-        # Сброс и запуск таймеров
         self._start_time = time.time()
         self._end_time = None
 
@@ -1045,9 +1134,6 @@ class App(tk.Tk):
                     f"Namespace: {namespace or '—'}. Разбор транзакций…",
                     "blue")
 
-                # Важно: время конца фиксируем ДО экспорта,
-                # чтобы в отчёт попали актуальные метки. Обновим после.
-                # На самом деле фиксируем сейчас и потом ещё раз в finally.
                 finished_at_for_report = datetime.now()
 
                 if fmt == "html":
@@ -1071,7 +1157,6 @@ class App(tk.Tk):
                 else:
                     raise ValueError(f"Неизвестный формат: {fmt}")
 
-                # Точный конец — уже после завершения записи файла
                 self._end_time = time.time()
                 end_dt = datetime.now()
                 total = self._end_time - self._start_time
