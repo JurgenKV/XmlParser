@@ -37,9 +37,6 @@ DEFAULT_LIMIT = 1000000
 EMPTY_MARK = "-"
 RECORD_NUM_COL = "__record_num__"
 
-# Размер чанка чтения файла
-CHUNK_SIZE = 4 * 1024 * 1024   # 4 МБ
-
 QUIK_FIELD_LABELS = {
     RECORD_NUM_COL: "Запись",
 
@@ -74,70 +71,142 @@ QUIK_NUMERIC_FIELDS = {
 
 
 # ============================================================
-# 1. САНИТИЗАЦИЯ XML
+# 0.1. САНИТИЗАЦИЯ XML (для QUIK-битых ""..."" и &)
 # ============================================================
 
+# Неэкранированные &, кроме уже валидных сущностей
 _AMP_FIX = re.compile(rb'&(?!amp;|lt;|gt;|quot;|apos;|#)')
-_DOUBLE_QUOTE_OPEN = re.compile(rb'=""([^"<>\s])')
-_DOUBLE_QUOTE_CLOSE = re.compile(rb'([^"<>\s])""')
+
+# ="" + <непустой, не-/символ> — начало «сломанного» значения
+_DOUBLE_QUOTE_OPEN = re.compile(rb'=""([^"<>\s/])')
+
+# <непустой> + "" — конец «сломанного» значения
+# Negative lookbehind (?<!=) — чтобы не портить пустые =""
+_DOUBLE_QUOTE_CLOSE = re.compile(rb'(?<!=)([^"<>\s])""')
 
 
 def _sanitize_tag(tag_bytes):
-    """
-    Санитизация одного тега (от < до >).
-    - неэкранированные & -> &amp;
-    - двойные кавычки внутри значения атрибута -> &quot;
-    """
-    # 1. & -> &amp; (кроме уже валидных сущностей)
+    """Чистит один тег (от < до >)."""
     tag_bytes = _AMP_FIX.sub(b'&amp;', tag_bytes)
-
-    # 2. ="...."  в начале значения: после ="" идёт непустой символ
-    #    Превращаем первую пару "" в ="&quot;
     tag_bytes = _DOUBLE_QUOTE_OPEN.sub(rb'="&quot;\1', tag_bytes)
-
-    # 3. ...."  в конце значения: непустой символ перед двумя кавычками
     tag_bytes = _DOUBLE_QUOTE_CLOSE.sub(rb'\1&quot;"', tag_bytes)
-
     return tag_bytes
 
 
 def _sanitize_chunk(raw):
     """
-    Санитизация куска XML.
-    Возвращает (cleaned_bytes, pending_bytes), где pending — это
-    незакрытый тег в конце куска (склеится со следующим куском).
+    Чистит кусок XML по тегам.
+    Возвращает (cleaned_bytes, pending_bytes):
+      - cleaned — то, что готово к парсеру,
+      - pending — незакрытый тег в конце чанка (склеить со следующим).
     """
     out = bytearray()
     pos = 0
     n = len(raw)
 
-    while True:
+    while pos < n:
         lt = raw.find(b'<', pos)
         if lt == -1:
-            # Дальше нет '<' — остаток это текст
             out.extend(raw[pos:])
             return bytes(out), b""
 
-        # Текст от прошлой позиции до этого '<' — не трогаем
-        out.extend(raw[pos:lt])
+        out.extend(raw[pos:lt])  # текст до тега — не трогаем
+
+        # пропускаем комментарии
+        if raw[lt:lt + 4] == b'<!--':
+            end = raw.find(b'-->', lt)
+            if end == -1:
+                return bytes(out), raw[lt:]
+            out.extend(raw[lt:end + 3])
+            pos = end + 3
+            continue
+
+        # пропускаем CDATA
+        if raw[lt:lt + 9] == b'<![CDATA[':
+            end = raw.find(b']]>', lt)
+            if end == -1:
+                return bytes(out), raw[lt:]
+            out.extend(raw[lt:end + 3])
+            pos = end + 3
+            continue
 
         gt = raw.find(b'>', lt)
         if gt == -1:
-            # Тег не закрыт — это конец чанка, отдаём как pending
-            pending = raw[lt:]
-            return bytes(out), pending
+            # тег обрывается на границе чанка — отдаём как pending
+            return bytes(out), raw[lt:]
 
-        # Тег целиком — санитизируем
-        tag = raw[lt:gt + 1]
-        out.extend(_sanitize_tag(tag))
+        out.extend(_sanitize_tag(raw[lt:gt + 1]))
         pos = gt + 1
 
-        if pos >= n:
-            return bytes(out), b""
+    return bytes(out), b""
+
+
+class SanitizedFile:
+    """
+    Обёртка над файлом, которая на лету чинит QUIK-битые ""..."" и &.
+    Использует буфер до 4 МБ, память O(1) по размеру файла.
+    Реализует read() так, как этого ждёт lxml.iterparse.
+    """
+    CHUNK = 4 * 1024 * 1024
+
+    def __init__(self, path):
+        self._f = open(path, "rb")
+        self._buffer = bytearray()
+        self._pending = b""
+        self._eof = False
+
+    def _fill(self):
+        """Догрузить данные из файла, если буфер пуст."""
+        while not self._eof and not self._buffer:
+            chunk = self._f.read(self.CHUNK)
+            if not chunk:
+                if self._pending:
+                    # файл оборвался внутри тега — отдаём как есть,
+                    # пусть парсер сам решает (recover=True)
+                    self._buffer.extend(self._pending)
+                    self._pending = b""
+                self._eof = True
+                break
+            data = self._pending + chunk
+            cleaned, self._pending = _sanitize_chunk(data)
+            self._buffer.extend(cleaned)
+
+    def read(self, size=-1):
+        if size is None or size < 0:
+            # читаем до конца файла
+            while not self._eof:
+                self._fill()
+                # В _fill может быть EOF, тогда break
+            result = bytes(self._buffer)
+            self._buffer.clear()
+            return result
+
+        while len(self._buffer) < size and not self._eof:
+            self._fill()
+
+        if not self._buffer:
+            return b""
+
+        take = min(size, len(self._buffer))
+        result = bytes(self._buffer[:take])
+        del self._buffer[:take]
+        return result
+
+    def close(self):
+        try:
+            self._f.close()
+        except Exception:
+            pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
 
 
 # ============================================================
-# 2. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# 1. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ============================================================
 
 def strip_ns(tag):
@@ -188,13 +257,11 @@ def format_quik_value(col, value):
     if not s:
         return EMPTY_MARK
 
-    # YYYY-MM-DD -> DD.MM.YYYY
     if len(s) == 10 and s[4] == "-" and s[7] == "-":
         y, m, d = s.split("-")
         if y.isdigit() and m.isdigit() and d.isdigit():
             return f"{d}.{m}.{y}"
 
-    # YYYYMMDD -> DD.MM.YYYY
     if base in ("TradeDate", "QuikDate", "Date", "SettleDate") \
             and len(s) == 8 and s.isdigit():
         return f"{s[6:8]}.{s[4:6]}.{s[0:4]}"
@@ -215,11 +282,12 @@ def format_quik_value(col, value):
 
 
 def detect_namespace(path):
-    """Быстро ищет xmlns= в первых 8 КБ файла. Устойчиво к битым местам."""
+    """Читает xmlns из первых 8 КБ файла. Не парсит весь файл."""
     try:
         with open(path, "rb") as f:
             head = f.read(8192)
-        m = re.search(rb'xmlns\s*=\s*"([^"]+)"', head)
+        cleaned, _ = _sanitize_chunk(head)
+        m = re.search(rb'xmlns\s*=\s*"([^"]+)"', cleaned)
         if m:
             return m.group(1).decode("ascii", errors="ignore")
     except Exception:
@@ -228,15 +296,16 @@ def detect_namespace(path):
 
 
 def read_report_header(path):
-    """Быстро читает атрибуты корня из первых 8 КБ файла."""
+    """Читает атрибуты корня из первых 8 КБ файла."""
     info = {"ProgramVersion": "", "StartDate": "", "EndDate": ""}
     try:
         with open(path, "rb") as f:
             head = f.read(8192)
+        cleaned, _ = _sanitize_chunk(head)
         for key in ("ProgramVersion", "StartDate", "EndDate"):
             m = re.search(
                 rb'%s\s*=\s*"([^"]*)"' % key.encode("ascii"),
-                head
+                cleaned
             )
             if m:
                 info[key] = m.group(1).decode("utf-8", errors="replace")
@@ -258,7 +327,7 @@ def format_date_string(s):
 
 
 # ============================================================
-# 3. КОНФИГ ИЗВЛЕЧЕНИЯ
+# 2. КОНФИГ ИЗВЛЕЧЕНИЯ
 # ============================================================
 
 class ExtractConfig:
@@ -278,18 +347,16 @@ class ExtractConfig:
 
 
 # ============================================================
-# 4. ИЗВЛЕЧЕНИЕ ЗАПИСЕЙ (устойчивое к "" и 30 ГБ)
+# 3. ИЗВЛЕЧЕНИЕ ЗАПИСЕЙ
 # ============================================================
 
 def extract_records(path, record_tag=RECORD_TAG, namespace=None,
                     config=None, descriptions=None,
                     progress_cb=None, cancel_flag=None, max_records=None):
     """
-    Устойчивый потоковый разбор QUIK XML:
-      - читаем файл кусками по 4 МБ;
-      - каждый кусок санитизируем (чиним ""..."" и &);
-      - незакрытые теги на границе склеиваем со следующим куском;
-      - парсер с recover=True и huge_tree=True.
+    Потоковый разбор QUIK XML.
+    Файл читается через SanitizedFile — все ""..."" на лету заменяются
+    на &quot;...&quot;, поэтому парсер не падает.
     """
     if config is None:
         config = ExtractConfig()
@@ -298,139 +365,97 @@ def extract_records(path, record_tag=RECORD_TAG, namespace=None,
 
     search_tag = qname(record_tag, namespace)
 
-    parser = ET.XMLPullParser(
-        events=("end",),
-        tag=search_tag,
-        recover=True,
-        huge_tree=True,
-        resolve_entities=False,
-        no_network=True,
-    )
+    with SanitizedFile(path) as f:
+        context = ET.iterparse(f, events=("end",), tag=search_tag)
 
-    count = 0
-    pending = b""
-
-    with open(path, "rb") as f:
-        while True:
+        count = 0
+        for _, elem in context:
             if cancel_flag and cancel_flag.is_set():
                 return
 
-            chunk = f.read(CHUNK_SIZE)
+            rec = {}
 
-            if not chunk:
-                # конец файла — отдаём остаток pending
-                if pending:
-                    cleaned, _ = _sanitize_chunk(pending)
-                    if cleaned:
+            # 1. Атрибуты Trans
+            for k, v in elem.attrib.items():
+                rec[f"@{strip_ns(k)}"] = v
+
+            # 2. Дети Trans
+            for child in elem:
+                if not isinstance(child.tag, str):
+                    continue
+                tag_local = strip_ns(child.tag)
+
+                if tag_local == config.container_tag:
+                    fields = list(child.findall(config.field_tag))
+                    if namespace and not fields:
+                        fields = list(child.findall(
+                            f"{{{namespace}}}{config.field_tag}"))
+
+                    def _num_key(fe):
                         try:
-                            parser.feed(cleaned)
-                        except Exception:
-                            pass
-                break
+                            return int(fe.get("Number") or 0)
+                        except ValueError:
+                            return 0
+                    fields.sort(key=_num_key)
 
-            data = pending + chunk
-            cleaned, pending = _sanitize_chunk(data)
+                    for field in fields:
+                        name = (field.get(config.name_attr) or "").strip()
+                        desc = (field.get(config.description_attr) or "").strip()
+                        prepared = (field.get(config.prepared_attr) or "").strip()
 
-            if cleaned:
-                try:
-                    parser.feed(cleaned)
-                except Exception:
-                    # recover=True должен это проглатывать, но на всякий случай
-                    pass
+                        if not name:
+                            continue
 
-            for _, elem in parser.read_events():
-                if cancel_flag and cancel_flag.is_set():
-                    return
+                        if desc and name not in descriptions:
+                            descriptions[name] = desc
 
-                rec = {}
+                        display = prepared  # ТОЛЬКО PreparedValue
 
-                # 1. Атрибуты Trans
-                for k, v in elem.attrib.items():
-                    rec[f"@{strip_ns(k)}"] = v
-
-                # 2. Обход детей Trans
-                for child in elem:
-                    if not isinstance(child.tag, str):
-                        continue
-                    tag_local = strip_ns(child.tag)
-
-                    if tag_local == config.container_tag:
-                        fields = list(child.findall(config.field_tag))
-                        if namespace and not fields:
-                            fields = list(child.findall(
-                                f"{{{namespace}}}{config.field_tag}"))
-
-                        def _num_key(fe):
-                            try:
-                                return int(fe.get("Number") or 0)
-                            except ValueError:
-                                return 0
-                        fields.sort(key=_num_key)
-
-                        for field in fields:
-                            name = (field.get(config.name_attr) or "").strip()
-                            desc = (field.get(config.description_attr) or "").strip()
-                            prepared = (field.get(config.prepared_attr) or "").strip()
-
-                            if not name:
-                                continue
-
-                            if desc and name not in descriptions:
-                                descriptions[name] = desc
-
-                            display = prepared
-
-                            if name in rec:
-                                i = 2
-                                while f"{name}_{i}" in rec:
-                                    i += 1
-                                rec[f"{name}_{i}"] = display
-                            else:
-                                rec[name] = display
-                        continue
-
-                    # обычный дочерний узел
-                    text = (child.text or "").strip()
-                    if text:
-                        key = tag_local
-                        if key in rec:
+                        if name in rec:
                             i = 2
-                            while f"{key}_{i}" in rec:
+                            while f"{name}_{i}" in rec:
                                 i += 1
-                            rec[f"{key}_{i}"] = text
+                            rec[f"{name}_{i}"] = display
                         else:
-                            rec[key] = text
+                            rec[name] = display
+                    continue
 
-                    for ak, av in child.attrib.items():
-                        key = f"{tag_local}.@{strip_ns(ak)}"
-                        if key in rec:
-                            i = 2
-                            while f"{key}_{i}" in rec:
-                                i += 1
-                            rec[f"{key}_{i}"] = av
-                        else:
-                            rec[key] = av
+                text = (child.text or "").strip()
+                if text:
+                    key = tag_local
+                    if key in rec:
+                        i = 2
+                        while f"{key}_{i}" in rec:
+                            i += 1
+                        rec[f"{key}_{i}"] = text
+                    else:
+                        rec[key] = text
 
-                yield rec
+                for ak, av in child.attrib.items():
+                    key = f"{tag_local}.@{strip_ns(ak)}"
+                    if key in rec:
+                        i = 2
+                        while f"{key}_{i}" in rec:
+                            i += 1
+                        rec[f"{key}_{i}"] = av
+                    else:
+                        rec[key] = av
 
-                elem.clear()
-                while elem.getprevious() is not None:
-                    del elem.getparent()[0]
+            yield rec
 
-                count += 1
-                if progress_cb and count % 1000 == 0:
-                    progress_cb(count)
-                if max_records and count >= max_records:
-                    return
+            elem.clear()
+            while elem.getprevious() is not None:
+                del elem.getparent()[0]
 
-        try:
-            parser.close()
-        except Exception:
-            pass
+            count += 1
+            if progress_cb and count % 1000 == 0:
+                progress_cb(count)
+            if max_records and count >= max_records:
+                return
 
 
 # ============================================================
-# 5. КОЛОНКИ
+# 4. КОЛОНКИ
 # ============================================================
 
 def inject_record_numbers(records):
@@ -456,7 +481,7 @@ def build_table_columns(card_columns):
 
 
 # ============================================================
-# 6. HTML
+# 5. HTML
 # ============================================================
 
 HTML_HEAD = """<!DOCTYPE html>
@@ -504,6 +529,7 @@ def export_html(xml_path, out_path, record_tag=RECORD_TAG, namespace=None,
     inject_record_numbers(records)
 
     card_columns, card_header_map = build_card_columns(records, descriptions)
+
     table_columns = build_table_columns(card_columns)
     table_header_map = {RECORD_NUM_COL: "Запись"}
     table_header_map.update(card_header_map)
@@ -557,7 +583,7 @@ def export_html(xml_path, out_path, record_tag=RECORD_TAG, namespace=None,
 
 
 # ============================================================
-# 7. PDF
+# 6. PDF
 # ============================================================
 
 def register_cyrillic_font():
@@ -595,6 +621,7 @@ def export_pdf(xml_path, out_path, record_tag=RECORD_TAG, namespace=None,
     inject_record_numbers(records)
 
     card_columns, card_header_map = build_card_columns(records, descriptions)
+
     table_columns = build_table_columns(card_columns)
     table_header_map = {RECORD_NUM_COL: "Запись"}
     table_header_map.update(card_header_map)
@@ -692,7 +719,7 @@ def export_pdf(xml_path, out_path, record_tag=RECORD_TAG, namespace=None,
 
 
 # ============================================================
-# 8. GUI
+# 7. GUI
 # ============================================================
 
 class App(tk.Tk):
