@@ -75,21 +75,22 @@ QUIK_NUMERIC_FIELDS = {
 # ============================================================
 
 # Неэкранированные &, кроме уже валидных сущностей
-_AMP_FIX = re.compile(rb'&(?!amp;|lt;|gt;|quot;|apos;|#)')
+_AMP_FIX = re.compile(rb'&(?!amp;|lt;|gt;|quot;|apos;|#\d+;)')
 
-# ="" + <непустой, не-/символ> — начало «сломанного» значения
-_DOUBLE_QUOTE_OPEN = re.compile(rb'=""([^"<>\s/])')
-
-# <непустой> + "" — конец «сломанного» значения
-# Negative lookbehind (?<!=) — чтобы не портить пустые =""
-_DOUBLE_QUOTE_CLOSE = re.compile(rb'(?<!=)([^"<>\s])""')
+# Сломанный QUIK-шаблон: =""X""  где X — непустое содержимое
+# Условия:
+#   =""               — начало значения с лишней кавычкой
+#   [^"\s/<>]         — первый символ не пробел, не /, не <, не >, не "
+#   [^"]*             — остаток содержимого без кавычек
+#   ""                — две кавычки в конце значения
+#   (?=[\s/>])        — сразу за ними пробел, / или > (конец атрибута)
+_BROKEN_QUOTE = re.compile(rb'=""([^"\s/<>][^"]*)""(?=[\s/>])')
 
 
 def _sanitize_tag(tag_bytes):
-    """Чистит один тег (от < до >)."""
+    """Чистит один тег: незаэкранированный & и QUIK-битые ""...""."""
     tag_bytes = _AMP_FIX.sub(b'&amp;', tag_bytes)
-    tag_bytes = _DOUBLE_QUOTE_OPEN.sub(rb'="&quot;\1', tag_bytes)
-    tag_bytes = _DOUBLE_QUOTE_CLOSE.sub(rb'\1&quot;"', tag_bytes)
+    tag_bytes = _BROKEN_QUOTE.sub(rb'="&quot;\1&quot;"', tag_bytes)
     return tag_bytes
 
 
@@ -144,8 +145,7 @@ def _sanitize_chunk(raw):
 class SanitizedFile:
     """
     Обёртка над файлом, которая на лету чинит QUIK-битые ""..."" и &.
-    Использует буфер до 4 МБ, память O(1) по размеру файла.
-    Реализует read() так, как этого ждёт lxml.iterparse.
+    Читает файл кусками по 4 МБ, память O(1) по размеру файла.
     """
     CHUNK = 4 * 1024 * 1024
 
@@ -156,13 +156,10 @@ class SanitizedFile:
         self._eof = False
 
     def _fill(self):
-        """Догрузить данные из файла, если буфер пуст."""
         while not self._eof and not self._buffer:
             chunk = self._f.read(self.CHUNK)
             if not chunk:
                 if self._pending:
-                    # файл оборвался внутри тега — отдаём как есть,
-                    # пусть парсер сам решает (recover=True)
                     self._buffer.extend(self._pending)
                     self._pending = b""
                 self._eof = True
@@ -173,10 +170,8 @@ class SanitizedFile:
 
     def read(self, size=-1):
         if size is None or size < 0:
-            # читаем до конца файла
             while not self._eof:
                 self._fill()
-                # В _fill может быть EOF, тогда break
             result = bytes(self._buffer)
             self._buffer.clear()
             return result
