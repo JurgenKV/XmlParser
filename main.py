@@ -1,6 +1,7 @@
 import os
 import re
 import html
+import queue
 import tempfile
 import threading
 from datetime import datetime
@@ -41,6 +42,9 @@ RECORD_NUM_COL = "__record_num__"
 # Размер чанка при чтении/записи
 CLEAN_CHUNK = 4 * 1024 * 1024   # 4 МБ
 
+# Глубина очередей (сколько чанков может висеть между потоками)
+QUEUE_DEPTH = 4
+
 QUIK_FIELD_LABELS = {
     RECORD_NUM_COL: "Запись",
 
@@ -75,63 +79,30 @@ QUIK_NUMERIC_FIELDS = {
 
 
 # ============================================================
-# 0.1. САНИТИЗАЦИЯ XML — отдельный проход по файлу
+# 0.1. САНИТИЗАЦИЯ XML — ускоренная + конвейерная
 # ============================================================
 
 # Неэкранированные &, кроме уже валидных сущностей
 _AMP_FIX = re.compile(rb'&(?!amp;|lt;|gt;|quot;|apos;|#\d+;)')
 
-# Сломанный QUIK-шаблон: =""X""   где X — непустое содержимое
-#    =""              — начало значения с лишней кавычкой
-#    [^"\s/<>]        — первый символ не пробел, не /, не <, не >, не "
-#    [^"]*            — остаток содержимого без кавычек
-#    ""               — две кавычки в конце значения
-#    (?=[\s/>])       — сразу за ними пробел, / или > (конец атрибута)
+# Сломанный QUIK-шаблон: =""X""
 _BROKEN_QUOTE = re.compile(rb'=""([^"\s/<>][^"]*)""(?=[\s/>])')
 
 
 def _sanitize_tag(tag_bytes):
     """Чистит один тег: незаэкранированный & и QUIK-битые ""...""."""
-    tag_bytes = _AMP_FIX.sub(b'&amp;', tag_bytes)
-    tag_bytes = _BROKEN_QUOTE.sub(rb'="&quot;\1&quot;"', tag_bytes)
+    if b'&' in tag_bytes:
+        tag_bytes = _AMP_FIX.sub(b'&amp;', tag_bytes)
+    if b'=""' in tag_bytes:
+        tag_bytes = _BROKEN_QUOTE.sub(rb'="&quot;\1&quot;"', tag_bytes)
     return tag_bytes
-
-
-def clean_xml_file(src_path, dst_path, progress_cb=None, cancel_flag=None):
-    """
-    Первый проход: читаем src_path кусками по 4 МБ, чиним битые кавычки
-    и неэкранированные & внутри тегов, пишем в dst_path.
-    Память O(1), никаких 30 ГБ в RAM.
-    """
-    pending = b""
-    total_read = 0
-
-    with open(src_path, "rb") as fi, open(dst_path, "wb") as fo:
-        while True:
-            if cancel_flag and cancel_flag.is_set():
-                raise RuntimeError("Отменено пользователем")
-
-            chunk = fi.read(CLEAN_CHUNK)
-            if not chunk:
-                # хвост
-                if pending:
-                    cleaned, _ = _process_clean_data(pending, final=True)
-                    fo.write(cleaned)
-                break
-
-            data = pending + chunk
-            cleaned, pending = _process_clean_data(data, final=False)
-            fo.write(cleaned)
-
-            total_read += len(chunk)
-            if progress_cb and total_read % (CLEAN_CHUNK * 10) == 0:
-                progress_cb(total_read)
 
 
 def _process_clean_data(raw, final):
     """
-    Чистит кусок XML, разбивая по тегам.
-    Возвращает (cleaned, pending). Если final=True — pending пустой.
+    Ускоренная очистка куска XML.
+    Разбиение на теги через bytes.split — цикл в C, не в Python.
+    Возвращает (cleaned, pending).
     """
     out = bytearray()
     pos = 0
@@ -140,11 +111,11 @@ def _process_clean_data(raw, final):
     while pos < n:
         lt = raw.find(b'<', pos)
         if lt == -1:
-            # дальше только текст
             out.extend(raw[pos:])
             return bytes(out), b""
 
-        out.extend(raw[pos:lt])  # текст до тега — не трогаем
+        # текст до тега — не трогаем
+        out.extend(raw[pos:lt])
 
         # комментарий
         if raw[lt:lt + 4] == b'<!--':
@@ -164,20 +135,117 @@ def _process_clean_data(raw, final):
             pos = end + 3
             continue
 
-        # обычный тег — ищем закрывающий >
         gt = raw.find(b'>', lt)
         if gt == -1:
-            # тег не закрылся в этом куске
             if final:
-                # конец файла — отдаём как есть, пусть парсер сам решит
                 out.extend(raw[lt:])
                 return bytes(out), b""
             return bytes(out), raw[lt:]
 
-        out.extend(_sanitize_tag(raw[lt:gt + 1]))
+        # ---- быстрая санитизация одного тега ----
+        tag = raw[lt:gt + 1]
+
+        # быстрая проверка, нужно ли чистить вообще
+        if b'&' in tag or b'=""' in tag:
+            tag = _sanitize_tag(tag)
+
+        out.extend(tag)
         pos = gt + 1
 
     return bytes(out), b""
+
+
+def _reader_thread(fi, raw_q, cancel_flag, clean_progress_cb, total_size):
+    """Поток 1: читает исходный файл и кладёт чанки в raw_q."""
+    try:
+        total_read = 0
+        while True:
+            if cancel_flag and cancel_flag.is_set():
+                break
+            chunk = fi.read(CLEAN_CHUNK)
+            if not chunk:
+                break
+            raw_q.put(chunk)
+            total_read += len(chunk)
+            if clean_progress_cb:
+                clean_progress_cb(total_read, total_size)
+    finally:
+        raw_q.put(None)  # сигнал конца
+
+
+def _cleaner_thread(raw_q, clean_q, cancel_flag):
+    """Поток 2: чистит чанки из raw_q и кладёт в clean_q."""
+    pending = b""
+    try:
+        while True:
+            if cancel_flag and cancel_flag.is_set():
+                break
+            chunk = raw_q.get()
+            if chunk is None:
+                # конец — обработаем остаток
+                if pending:
+                    cleaned, _ = _process_clean_data(pending, final=True)
+                    if cleaned:
+                        clean_q.put(cleaned)
+                break
+
+            data = pending + chunk
+            cleaned, pending = _process_clean_data(data, final=False)
+            if cleaned:
+                clean_q.put(cleaned)
+    finally:
+        clean_q.put(None)  # сигнал конца
+
+
+def _writer_thread(fo, clean_q, cancel_flag):
+    """Поток 3: пишет очищенные чанки в файл."""
+    try:
+        while True:
+            chunk = clean_q.get()
+            if chunk is None:
+                break
+            if cancel_flag and cancel_flag.is_set():
+                break
+            fo.write(chunk)
+    finally:
+        fo.flush()
+
+
+def clean_xml_file(src_path, dst_path, progress_cb=None, cancel_flag=None):
+    """
+    Очистка XML в конвейере из трёх потоков.
+    progress_cb получает (bytes_read, total_size).
+    """
+    total_size = os.path.getsize(src_path)
+
+    raw_q = queue.Queue(maxsize=QUEUE_DEPTH)
+    clean_q = queue.Queue(maxsize=QUEUE_DEPTH)
+
+    def progress_wrap(read, total):
+        if progress_cb:
+            progress_cb(read, total)
+
+    with open(src_path, "rb") as fi, open(dst_path, "wb") as fo:
+        t_reader = threading.Thread(
+            target=_reader_thread,
+            args=(fi, raw_q, cancel_flag, progress_wrap, total_size),
+            daemon=True)
+        t_cleaner = threading.Thread(
+            target=_cleaner_thread,
+            args=(raw_q, clean_q, cancel_flag),
+            daemon=True)
+        t_writer = threading.Thread(
+            target=_writer_thread,
+            args=(fo, clean_q, cancel_flag),
+            daemon=True)
+
+        t_reader.start()
+        t_cleaner.start()
+        t_writer.start()
+
+        t_writer.join()
+        t_cleaner.join()
+        t_reader.join()
 
 
 # ============================================================
@@ -257,7 +325,6 @@ def format_quik_value(col, value):
 
 
 def detect_namespace(path):
-    """Читает xmlns из первых 8 КБ файла."""
     try:
         with open(path, "rb") as f:
             head = f.read(8192)
@@ -270,7 +337,6 @@ def detect_namespace(path):
 
 
 def read_report_header(path):
-    """Читает атрибуты корня из первых 8 КБ файла."""
     info = {"ProgramVersion": "", "StartDate": "", "EndDate": ""}
     try:
         with open(path, "rb") as f:
@@ -326,9 +392,6 @@ class ExtractConfig:
 def extract_records(path, record_tag=RECORD_TAG, namespace=None,
                     config=None, descriptions=None,
                     progress_cb=None, cancel_flag=None, max_records=None):
-    """
-    Работает с уже очищенным файлом. Обычный iterparse.
-    """
     if config is None:
         config = ExtractConfig()
     if descriptions is None:
@@ -346,11 +409,9 @@ def extract_records(path, record_tag=RECORD_TAG, namespace=None,
 
             rec = {}
 
-            # 1. Атрибуты Trans
             for k, v in elem.attrib.items():
                 rec[f"@{strip_ns(k)}"] = v
 
-            # 2. Дети Trans
             for child in elem:
                 if not isinstance(child.tag, str):
                     continue
@@ -516,7 +577,9 @@ def export_html(clean_xml_path, out_path, record_tag=RECORD_TAG,
     meta_lines.append(f"Источник: {os.path.basename(clean_xml_path)}")
     meta_lines.append(f"Записей: {len(records)}")
 
-    with open(out_path, "w", encoding="utf-8") as f:
+    # Буферизованная запись — крупный буфер в 1 МБ
+    with open(out_path, "w", encoding="utf-8",
+              buffering=1024 * 1024) as f:
         f.write(HTML_HEAD.format(
             title="Отчёт по транзакциям QUIK",
             meta="<br>".join(_esc(m) for m in meta_lines),
@@ -766,9 +829,13 @@ class App(tk.Tk):
         if count % 5000 == 0:
             self._set_status(f"Обработано записей: {count:,}", "blue")
 
-    def _clean_progress_cb(self, bytes_read):
-        mb = bytes_read // (1024 * 1024)
-        self._set_status(f"Очистка XML: {mb} МБ обработано", "blue")
+    def _clean_progress_cb(self, bytes_read, total_size):
+        if total_size > 0:
+            pct = bytes_read * 100 // total_size
+            mb = bytes_read // (1024 * 1024)
+            total_mb = total_size // (1024 * 1024)
+            self._set_status(
+                f"Очистка XML: {pct}% ({mb} / {total_mb} МБ)", "blue")
 
     def convert(self):
         xml_file = self.xml_path.get().strip()
@@ -799,14 +866,11 @@ class App(tk.Tk):
         def worker():
             clean_path = None
             try:
-                # 1. Создаём временный файл рядом с исходным
-                #    (чтобы не улететь на другой диск — там может не быть места)
                 src_dir = os.path.dirname(os.path.abspath(xml_file))
                 tmp_fd, clean_path = tempfile.mkstemp(
                     prefix="quik_clean_", suffix=".xml", dir=src_dir)
                 os.close(tmp_fd)
 
-                # 2. Очистка файла — первый проход
                 self._set_status("Очистка XML…", "blue")
                 clean_xml_file(
                     xml_file, clean_path,
@@ -816,13 +880,11 @@ class App(tk.Tk):
                 if self.cancel_flag.is_set():
                     raise RuntimeError("Отменено")
 
-                # 3. Определяем namespace уже в чистом файле
                 namespace = detect_namespace(clean_path)
                 self._set_status(
                     f"Namespace: {namespace or '—'}. Разбор транзакций…",
                     "blue")
 
-                # 4. Строим отчёт из чистого файла
                 if fmt == "html":
                     export_html(clean_path, out_path, RECORD_TAG,
                                 namespace=namespace, config=config,
@@ -848,7 +910,6 @@ class App(tk.Tk):
                 self.after(0, self._show_error, "Ошибка", err)
 
             finally:
-                # 5. Удаляем временный файл
                 if clean_path and os.path.exists(clean_path):
                     try:
                         os.remove(clean_path)
