@@ -2,6 +2,7 @@ import os
 import re
 import html
 import queue
+import shutil
 import tempfile
 import threading
 import time
@@ -43,6 +44,9 @@ CLEAN_CHUNK = 4 * 1024 * 1024
 QUEUE_DEPTH = 4
 
 FAST_LEN_THRESHOLD = 20
+
+# Оставлять ли временные файлы после работы (для отладки)
+KEEP_TEMP_FILES = False
 
 RU_MONTHS = [
     "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
@@ -100,9 +104,9 @@ def fmt_duration(seconds):
     return " ".join(parts)
 
 
-def extract_month_key(rec):
-    """(sort_key, label) по @TradeDate. Пример: ('2019-06','2019_Июнь')."""
-    d = (rec.get(TRADE_DATE_ATTR) or "").strip()
+def date_str_to_month(d):
+    """'2019-06-04' или '20190604' → ('2019-06', '2019_Июнь')."""
+    d = (d or "").strip()
 
     if len(d) == 10 and d[4] == "-" and d[7] == "-":
         try:
@@ -125,6 +129,10 @@ def extract_month_key(rec):
             pass
 
     return ("0000-00", "0000_БезДаты")
+
+
+def extract_month_key(rec):
+    return date_str_to_month(rec.get(TRADE_DATE_ATTR, ""))
 
 
 # ============================================================
@@ -272,6 +280,158 @@ def clean_xml_file(src_path, dst_path, progress_cb=None, cancel_flag=None):
         t_writer.join()
         t_cleaner.join()
         t_reader.join()
+
+
+# ============================================================
+# 0.3. РАЗБИВКА XML ПО МЕСЯЦАМ — ОДИН ПРОХОД
+# ============================================================
+
+# <Trans + пробел/таб/перевод/'>'  — но не <TransData, не <TransactionsReport
+_TRANS_START_RE = re.compile(rb'<Trans(?=[\s>])')
+_TRADE_DATE_RE = re.compile(rb'\bTradeDate\s*=\s*"([^"]*)"')
+
+
+def split_xml_by_month(clean_src_path, split_dir,
+                       progress_cb=None, cancel_flag=None):
+    """
+    Читает clean_src_path (уже очищенный) и режет его на файлы
+    по месяцам — по границам </Trans>.
+    В split_dir кладёт файлы <ym>.xml (например, 2019-01.xml).
+
+    Возвращает dict: {ym: {'label': ..., 'path': ..., 'count': N}}
+    """
+    os.makedirs(split_dir, exist_ok=True)
+
+    # ---- 1. Найти преамбулу (всё до <TransactionsReport ...>) ----
+    with open(clean_src_path, "rb") as f:
+        head = f.read(16384)
+
+    m = re.search(rb'<TransactionsReport\b[^>]*>', head, re.DOTALL)
+    if not m:
+        raise RuntimeError(
+            "Не найден корневой тег <TransactionsReport> в первых "
+            "16 КБ. Возможно, файл не QUIK-XML.")
+    root_open_end = m.end()
+    preamble = head[:root_open_end]
+    closing_tag = b'\n</TransactionsReport>\n'
+
+    # ---- 2. Буферы записи для каждого месяца ----
+    open_files = {}
+
+    def get_writer(ym, label):
+        entry = open_files.get(ym)
+        if entry is None:
+            path = os.path.join(split_dir, f"{ym}.xml")
+            fd = open(path, "wb", buffering=1024 * 1024)
+            fd.write(preamble)
+            fd.write(b"\n")
+            entry = {"fd": fd, "path": path, "label": label,
+                     "count": 0}
+            open_files[ym] = entry
+        return entry
+
+    # ---- 3. Идём по файлу, отслеживая <Trans>...</Trans> ----
+    total_read = 0
+    file_size = os.path.getsize(clean_src_path)
+
+    buf = bytearray()          # накопленный текст незавершённой записи
+    in_trans = False
+    current_ym = None
+    current_label = None
+    date_parsed = False        # уже разобрали TradeDate для текущей записи?
+
+    with open(clean_src_path, "rb") as f:
+        f.seek(root_open_end)
+
+        while True:
+            if cancel_flag and cancel_flag.is_set():
+                break
+
+            chunk = f.read(CLEAN_CHUNK)
+            if not chunk:
+                break
+
+            total_read += len(chunk)
+            if progress_cb:
+                progress_cb(total_read, file_size)
+
+            data = chunk
+            pos = 0
+
+            while pos < len(data):
+                if not in_trans:
+                    # Ищем начало <Trans
+                    m = _TRANS_START_RE.search(data, pos)
+                    if not m:
+                        pos = len(data)
+                        break
+
+                    in_trans = True
+                    date_parsed = False
+                    current_ym = None
+                    current_label = None
+                    buf = bytearray()
+                    pos = m.start()
+                    # не продолжаем здесь — упадём в блок "мы внутри Trans"
+
+                # Мы внутри <Trans> — накапливаем байты до </Trans>.
+                # Отдельно ищем первый '>' для разбора TradeDate.
+                if not date_parsed:
+                    gt = data.find(b'>', pos)
+                    if gt != -1:
+                        # Разбираем TradeDate в открывающем теге
+                        tag_bytes = bytes(buf) + data[pos:gt + 1]
+                        m2 = _TRADE_DATE_RE.search(tag_bytes)
+                        if m2:
+                            d = m2.group(1).decode("ascii",
+                                                   errors="ignore")
+                            current_ym, current_label = \
+                                date_str_to_month(d)
+                        else:
+                            current_ym, current_label = (
+                                "0000-00", "0000_БезДаты")
+                        date_parsed = True
+
+                # Ищем </Trans>
+                end = data.find(b'</Trans>', pos)
+                if end == -1:
+                    buf.extend(data[pos:])
+                    pos = len(data)
+                    break
+
+                # Нашли </Trans>
+                end_pos = end + len(b'</Trans>')
+                buf.extend(data[pos:end_pos])
+
+                if current_ym is None:
+                    current_ym, current_label = (
+                        "0000-00", "0000_БезДаты")
+
+                entry = get_writer(current_ym, current_label)
+                entry["fd"].write(bytes(buf))
+                entry["fd"].write(b"\n")
+                entry["count"] += 1
+
+                # Сброс
+                buf = bytearray()
+                in_trans = False
+                date_parsed = False
+                current_ym = None
+                current_label = None
+                pos = end_pos
+
+    # ---- 4. Закрываем все файлы ----
+    result = {}
+    for ym, entry in open_files.items():
+        entry["fd"].write(closing_tag)
+        entry["fd"].close()
+        result[ym] = {
+            "label": entry["label"],
+            "path": entry["path"],
+            "count": entry["count"],
+        }
+
+    return result
 
 
 # ============================================================
@@ -516,7 +676,6 @@ def extract_records(path, record_tag=RECORD_TAG, namespace=None,
 # ============================================================
 
 def build_columns_from_seen(seen, descriptions=None):
-    """Строит columns и header_map из множества ключей seen."""
     columns = list(seen.keys())
     header_map = {c: label_for(c, descriptions) for c in columns}
     return columns, header_map
@@ -529,6 +688,10 @@ def build_table_columns(card_columns):
 # ============================================================
 # 5. HTML (один месяц)
 # ============================================================
+
+def _esc(s):
+    return html.escape(str(s))
+
 
 HTML_HEAD = """<!DOCTYPE html>
 <html lang="ru"><head><meta charset="utf-8">
@@ -556,18 +719,10 @@ HTML_HEAD = """<!DOCTYPE html>
 """
 
 
-def _esc(s):
-    return html.escape(str(s))
-
-
 def export_html_month(out_path, month_label, records_iter,
                       card_columns, card_header_map,
                       header, started_at, finished_at,
                       as_cards, progress_cb=None, cancel_flag=None):
-    """
-    Пишет HTML для одного месяца, потоково читая records_iter.
-    records_iter — генератор записей ТОЛЬКО этого месяца.
-    """
     table_columns = build_table_columns(card_columns)
     table_header_map = {RECORD_NUM_COL: "Запись"}
     table_header_map.update(card_header_map)
@@ -578,56 +733,28 @@ def export_html_month(out_path, month_label, records_iter,
     duration_sec = (finished_at - started_at).total_seconds()
 
     title = f"Отчёт по транзакциям QUIK — {month_label}"
-
-    # Количество записей заранее неизвестно — соберём во время записи
     count = 0
+
+    meta_lines = [
+        f"Дата формирования: {now.strftime('%d.%m.%Y %H:%M:%S')}",
+        f"Начало обработки: {started_at.strftime('%d.%m.%Y %H:%M:%S')}",
+        f"Конец обработки: {finished_at.strftime('%d.%m.%Y %H:%M:%S')}",
+        f"Затрачено времени: {fmt_duration(duration_sec)}",
+        f"Месяц: {month_label}",
+    ]
+    if header.get("StartDate") or header.get("EndDate"):
+        s = format_date_string(header.get("StartDate", ""))
+        e = format_date_string(header.get("EndDate", ""))
+        meta_lines.append(f"Период (из XML): {s} — {e}")
+    if header.get("ProgramVersion"):
+        meta_lines.append(f"Версия QUIK: {header['ProgramVersion']}")
 
     with open(out_path, "w", encoding="utf-8",
               buffering=1024 * 1024) as f:
-        # Шапку пишем сразу, но с плейсхолдером количества
-        f.write("""<!DOCTYPE html>
-<html lang="ru"><head><meta charset="utf-8">
-<title>{title}</title>
-<style>
-  body {{ font-family: -apple-system, Segoe UI, Arial, sans-serif;
-         margin: 2em; color: #222; }}
-  h1 {{ border-bottom: 2px solid #444; padding-bottom: .3em; }}
-  .meta {{ color: #555; font-size: 13px; margin-bottom: 1em; }}
-  table {{ border-collapse: collapse; margin: 1em 0; width: 100%;
-           font-size: 13px; }}
-  th, td {{ border: 1px solid #ccc; padding: 6px 10px; text-align: left;
-            vertical-align: top; }}
-  th {{ background: #f0f4f8; position: sticky; top: 0; }}
-  tr:nth-child(even) {{ background: #fafbfc; }}
-  td.num {{ text-align: right; font-variant-numeric: tabular-nums; }}
-  .card {{ border: 1px solid #ddd; border-radius: 6px; padding: 12px 16px;
-           margin: 8px 0; background: #fafbfc; }}
-  .card h3 {{ margin-top: 0; color: #004a99; }}
-  .field {{ margin: 2px 0; }}
-  .field b {{ color: #333; }}
-</style></head><body>
-""".format(title=_esc(title)))
-
-        f.write(f"<h1>{_esc(title)}</h1>\n")
-        f.write('<div class="meta">')
-
-        meta_lines = [
-            f"Дата формирования: {now.strftime('%d.%m.%Y %H:%M:%S')}",
-            f"Начало обработки: {started_at.strftime('%d.%m.%Y %H:%M:%S')}",
-            f"Конец обработки: {finished_at.strftime('%d.%m.%Y %H:%M:%S')}",
-            f"Затрачено времени: {fmt_duration(duration_sec)}",
-            f"Месяц: {month_label}",
-        ]
-        if header.get("StartDate") or header.get("EndDate"):
-            s = format_date_string(header.get("StartDate", ""))
-            e = format_date_string(header.get("EndDate", ""))
-            meta_lines.append(f"Период (из XML): {s} — {e}")
-        if header.get("ProgramVersion"):
-            meta_lines.append(
-                f"Версия QUIK: {header['ProgramVersion']}")
-
-        f.write("<br>".join(_esc(m) for m in meta_lines))
-        f.write("</div>\n")
+        f.write(HTML_HEAD.format(
+            title=_esc(title),
+            meta="<br>".join(_esc(m) for m in meta_lines),
+        ))
 
         if as_cards:
             for rec in records_iter:
@@ -747,10 +874,6 @@ def export_pdf_month(out_path, month_label, records_iter,
                      card_columns, card_header_map,
                      header, started_at, finished_at,
                      as_cards, progress_cb=None, cancel_flag=None):
-    """
-    Пишет PDF для одного месяца, потоково читая records_iter.
-    Возвращает количество записей.
-    """
     font = register_cyrillic_font()
 
     table_columns = build_table_columns(card_columns)
@@ -872,7 +995,6 @@ def export_pdf_month(out_path, month_label, records_iter,
 
     count = 0
 
-    # ────── Карточки ──────
     if as_cards:
         page_y = draw_report_header(True)
         card_line_h = body_font_size * 1.3
@@ -977,73 +1099,7 @@ def export_pdf_month(out_path, month_label, records_iter,
 
 
 # ============================================================
-# 7. ПРОХОД 1: определить месяцы и колонки
-# ============================================================
-
-def scan_months_and_columns(clean_xml_path, namespace, config,
-                            cancel_flag=None, progress_cb=None):
-    """
-    Один быстрый проход по XML, чтобы собрать:
-      - множество месяцев (sort_key → label)
-      - общий набор колонок (seen)
-      - descriptions
-    Ни одна запись не хранится в памяти — только агрегаты.
-    """
-    months = {}     # {ym: label}
-    seen = {}       # {key: True} — порядок первого появления
-    descriptions = {}
-    total = 0
-
-    for rec in extract_records(
-            clean_xml_path, RECORD_TAG, namespace,
-            config=config, descriptions=descriptions,
-            progress_cb=None, cancel_flag=cancel_flag,
-            max_records=DEFAULT_LIMIT):
-        if cancel_flag and cancel_flag.is_set():
-            break
-
-        ym, label = extract_month_key(rec)
-        if ym not in months:
-            months[ym] = label
-
-        for k in rec:
-            if k == RECORD_NUM_COL:
-                continue
-            if k not in seen:
-                seen[k] = True
-
-        total += 1
-        if progress_cb and total % 20000 == 0:
-            progress_cb(total)
-
-    return months, seen, descriptions, total
-
-
-# ============================================================
-# 8. ПРОХОД 2..K+1: построить файл для одного месяца
-# ============================================================
-
-def make_month_records_iter(clean_xml_path, namespace, config,
-                            descriptions, target_ym, cancel_flag):
-    """
-    Генератор записей ТОЛЬКО указанного месяца.
-    Проходит XML от начала до конца, но отдаёт только подходящие.
-    """
-    for rec in extract_records(
-            clean_xml_path, RECORD_TAG, namespace,
-            config=config, descriptions=descriptions,
-            progress_cb=None, cancel_flag=cancel_flag,
-            max_records=DEFAULT_LIMIT):
-        if cancel_flag and cancel_flag.is_set():
-            return
-
-        ym, _ = extract_month_key(rec)
-        if ym == target_ym:
-            yield rec
-
-
-# ============================================================
-# 9. GUI
+# 7. GUI
 # ============================================================
 
 class App(tk.Tk):
@@ -1157,6 +1213,15 @@ class App(tk.Tk):
             self._set_status(
                 f"Очистка XML: {pct}% ({mb} / {total_mb} МБ)", "blue")
 
+    def _split_progress_cb(self, bytes_read, total_size):
+        if total_size > 0:
+            pct = bytes_read * 100 // total_size
+            mb = bytes_read // (1024 * 1024)
+            total_mb = total_size // (1024 * 1024)
+            self._set_status(
+                f"Резка по месяцам: {pct}% ({mb} / {total_mb} МБ)",
+                "blue")
+
     def convert(self):
         xml_file = self.xml_path.get().strip()
         if not xml_file or not os.path.isfile(xml_file):
@@ -1192,15 +1257,20 @@ class App(tk.Tk):
         self._set_status("Формирование отчётов…", "blue")
 
         def worker():
-            clean_path = None
+            work_dir = None
             try:
+                # Рабочая папка — рядом с исходным файлом, чтобы не
+                # улететь на другой диск (там может не быть места)
                 src_dir = os.path.dirname(os.path.abspath(xml_file))
-                tmp_fd, clean_path = tempfile.mkstemp(
-                    prefix="quik_clean_", suffix=".xml", dir=src_dir)
-                os.close(tmp_fd)
+                work_dir = tempfile.mkdtemp(
+                    prefix="quik_work_", dir=src_dir)
 
-                # 1. Очистка XML
-                self._set_status("Очистка XML…", "blue")
+                clean_path = os.path.join(work_dir, "clean.xml")
+                split_dir = os.path.join(work_dir, "months")
+                os.makedirs(split_dir, exist_ok=True)
+
+                # ─── ЭТАП 1: очистка XML ───
+                self._set_status("Этап 1/3: очистка XML…", "blue")
                 clean_xml_file(
                     xml_file, clean_path,
                     progress_cb=self._clean_progress_cb,
@@ -1209,31 +1279,54 @@ class App(tk.Tk):
                 if self.cancel_flag.is_set():
                     raise RuntimeError("Отменено")
 
-                namespace = detect_namespace(clean_path)
-                header = read_report_header(clean_path)
+                # ─── ЭТАП 2: резка по месяцам ───
+                self._set_status(
+                    "Этап 2/3: резка XML по месяцам…", "blue")
 
-                # 2. ПРОХОД 1: определить месяцы и колонки
-                self._set_status("Проход 1/…: определение месяцев "
-                                 "и колонок…", "blue")
-
-                months, seen, descriptions, total = \
-                    scan_months_and_columns(
-                        clean_path, namespace, config,
-                        cancel_flag=self.cancel_flag,
-                        progress_cb=self._progress_cb)
+                months_info = split_xml_by_month(
+                    clean_path, split_dir,
+                    progress_cb=self._split_progress_cb,
+                    cancel_flag=self.cancel_flag)
 
                 if self.cancel_flag.is_set():
                     raise RuntimeError("Отменено")
 
-                if not months:
+                if not months_info:
                     raise RuntimeError(
                         "В файле не найдено ни одной транзакции.")
 
-                # Колонки (все, встретившиеся в файле)
-                card_columns, card_header_map = build_columns_from_seen(
-                    seen, descriptions)
+                # Очищенный файл больше не нужен — можно удалить
+                if not KEEP_TEMP_FILES:
+                    try:
+                        os.remove(clean_path)
+                    except Exception:
+                        pass
 
-                # 3. Готовим папку для отчётов
+                # Читаем header и namespace уже из первого файла-месяца
+                # (там та же преамбула, что в исходном)
+                first_month_path = list(months_info.values())[0]["path"]
+                namespace = detect_namespace(first_month_path)
+                header = read_report_header(first_month_path)
+
+                # Определяем колонки по первому месяцу (пробный проход
+                # по первым 200 записям — быстро)
+                sample_seen = {}
+                sample_desc = {}
+                for i, rec in enumerate(extract_records(
+                        first_month_path, RECORD_TAG, namespace,
+                        config=config, descriptions=sample_desc,
+                        progress_cb=None, cancel_flag=self.cancel_flag,
+                        max_records=200)):
+                    for k in rec:
+                        if k == RECORD_NUM_COL:
+                            continue
+                        if k not in sample_seen:
+                            sample_seen[k] = True
+
+                card_columns, card_header_map = build_columns_from_seen(
+                    sample_seen, sample_desc)
+
+                # ─── ЭТАП 3: генерация отчётов ───
                 out_dir_base = os.path.dirname(os.path.abspath(out_path))
                 base_name = os.path.splitext(
                     os.path.basename(out_path))[0]
@@ -1241,8 +1334,7 @@ class App(tk.Tk):
                                            f"{base_name}_reports")
                 os.makedirs(reports_dir, exist_ok=True)
 
-                # 4. ПРОХОДЫ 2..K+1: пишем файлы по месяцам
-                months_sorted = sorted(months.keys())
+                months_sorted = sorted(months_info.keys())
                 K = len(months_sorted)
                 written = []
 
@@ -1250,18 +1342,22 @@ class App(tk.Tk):
                     if self.cancel_flag.is_set():
                         break
 
-                    month_label = months[ym]
+                    info = months_info[ym]
+                    month_label = info["label"]
+                    month_path = info["path"]
                     file_name = f"{base_name}_{month_label}.{ext}"
                     file_path = os.path.join(reports_dir, file_name)
 
                     self._set_status(
-                        f"Проход {i + 1}/{K + 1}: месяц {month_label}…",
-                        "blue")
+                        f"Этап 3/3: {i}/{K} — {month_label} "
+                        f"({info['count']} записей)…", "blue")
 
-                    # Генератор записей только этого месяца
-                    records_iter = make_month_records_iter(
-                        clean_path, namespace, config,
-                        descriptions, ym, self.cancel_flag)
+                    records_iter = extract_records(
+                        month_path, RECORD_TAG, namespace,
+                        config=config, descriptions=sample_desc,
+                        progress_cb=self._progress_cb,
+                        cancel_flag=self.cancel_flag,
+                        max_records=DEFAULT_LIMIT)
 
                     finished_at = datetime.now()
 
@@ -1298,8 +1394,10 @@ class App(tk.Tk):
                 if not written:
                     raise RuntimeError("Отчёты не сформированы (отменено)")
 
+                total_records = sum(c for _, c in written)
+
                 msg_lines = [
-                    f"Всего записей в XML: {total}",
+                    f"Всего записей: {total_records}",
                     f"Месяцев: {len(written)}",
                     f"Папка: {reports_dir}",
                     "",
@@ -1330,11 +1428,14 @@ class App(tk.Tk):
                 self.after(0, self._show_error, "Ошибка", err)
 
             finally:
-                if clean_path and os.path.exists(clean_path):
-                    try:
-                        os.remove(clean_path)
-                    except Exception:
-                        pass
+                if work_dir and os.path.exists(work_dir):
+                    if KEEP_TEMP_FILES:
+                        print(f"[DEBUG] Временные файлы в: {work_dir}")
+                    else:
+                        try:
+                            shutil.rmtree(work_dir, ignore_errors=True)
+                        except Exception:
+                            pass
 
                 self.after(0, self._reset_ui)
 
