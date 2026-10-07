@@ -1,4 +1,5 @@
 import os
+import re
 import html
 import threading
 from datetime import datetime
@@ -34,15 +35,14 @@ PREPARED_ATTR = "PreparedValue"
 DEFAULT_LIMIT = 1000000
 
 EMPTY_MARK = "-"
-
-# Синтетическая колонка «Запись» — порядковый номер строки в таблице
 RECORD_NUM_COL = "__record_num__"
 
+# Размер чанка чтения файла
+CHUNK_SIZE = 4 * 1024 * 1024   # 4 МБ
+
 QUIK_FIELD_LABELS = {
-    # Синтетическая колонка «Запись» (номер строки)
     RECORD_NUM_COL: "Запись",
 
-    # Атрибуты Trans
     "@TransNum":   "№ транзакции",
     "@UID":        "UID",
     "@TransID":    "ID транзакции",
@@ -74,7 +74,70 @@ QUIK_NUMERIC_FIELDS = {
 
 
 # ============================================================
-# 1. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# 1. САНИТИЗАЦИЯ XML
+# ============================================================
+
+_AMP_FIX = re.compile(rb'&(?!amp;|lt;|gt;|quot;|apos;|#)')
+_DOUBLE_QUOTE_OPEN = re.compile(rb'=""([^"<>\s])')
+_DOUBLE_QUOTE_CLOSE = re.compile(rb'([^"<>\s])""')
+
+
+def _sanitize_tag(tag_bytes):
+    """
+    Санитизация одного тега (от < до >).
+    - неэкранированные & -> &amp;
+    - двойные кавычки внутри значения атрибута -> &quot;
+    """
+    # 1. & -> &amp; (кроме уже валидных сущностей)
+    tag_bytes = _AMP_FIX.sub(b'&amp;', tag_bytes)
+
+    # 2. ="...."  в начале значения: после ="" идёт непустой символ
+    #    Превращаем первую пару "" в ="&quot;
+    tag_bytes = _DOUBLE_QUOTE_OPEN.sub(rb'="&quot;\1', tag_bytes)
+
+    # 3. ...."  в конце значения: непустой символ перед двумя кавычками
+    tag_bytes = _DOUBLE_QUOTE_CLOSE.sub(rb'\1&quot;"', tag_bytes)
+
+    return tag_bytes
+
+
+def _sanitize_chunk(raw):
+    """
+    Санитизация куска XML.
+    Возвращает (cleaned_bytes, pending_bytes), где pending — это
+    незакрытый тег в конце куска (склеится со следующим куском).
+    """
+    out = bytearray()
+    pos = 0
+    n = len(raw)
+
+    while True:
+        lt = raw.find(b'<', pos)
+        if lt == -1:
+            # Дальше нет '<' — остаток это текст
+            out.extend(raw[pos:])
+            return bytes(out), b""
+
+        # Текст от прошлой позиции до этого '<' — не трогаем
+        out.extend(raw[pos:lt])
+
+        gt = raw.find(b'>', lt)
+        if gt == -1:
+            # Тег не закрыт — это конец чанка, отдаём как pending
+            pending = raw[lt:]
+            return bytes(out), pending
+
+        # Тег целиком — санитизируем
+        tag = raw[lt:gt + 1]
+        out.extend(_sanitize_tag(tag))
+        pos = gt + 1
+
+        if pos >= n:
+            return bytes(out), b""
+
+
+# ============================================================
+# 2. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ============================================================
 
 def strip_ns(tag):
@@ -136,11 +199,9 @@ def format_quik_value(col, value):
             and len(s) == 8 and s.isdigit():
         return f"{s[6:8]}.{s[4:6]}.{s[0:4]}"
 
-    # Время как есть
     if base in ("QuikTime", "ReplyTime", "Time"):
         return s
 
-    # Числа — убираем лишние нули
     if base in QUIK_NUMERIC_FIELDS:
         try:
             num = float(s.replace(",", "."))
@@ -154,25 +215,33 @@ def format_quik_value(col, value):
 
 
 def detect_namespace(path):
-    with open(path, "rb") as f:
-        for _, elem in ET.iterparse(f, events=("start",)):
-            tag = elem.tag
-            if isinstance(tag, str) and tag.startswith("{"):
-                return tag.split("}", 1)[0][1:]
-            return None
+    """Быстро ищет xmlns= в первых 8 КБ файла. Устойчиво к битым местам."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(8192)
+        m = re.search(rb'xmlns\s*=\s*"([^"]+)"', head)
+        if m:
+            return m.group(1).decode("ascii", errors="ignore")
+    except Exception:
+        pass
     return None
 
 
 def read_report_header(path):
-    """Читает атрибуты корневого узла TransactionsReport."""
+    """Быстро читает атрибуты корня из первых 8 КБ файла."""
     info = {"ProgramVersion": "", "StartDate": "", "EndDate": ""}
-    with open(path, "rb") as f:
-        for _, elem in ET.iterparse(f, events=("start",)):
-            for k in ("ProgramVersion", "StartDate", "EndDate"):
-                v = elem.get(k)
-                if v:
-                    info[k] = v
-            break
+    try:
+        with open(path, "rb") as f:
+            head = f.read(8192)
+        for key in ("ProgramVersion", "StartDate", "EndDate"):
+            m = re.search(
+                rb'%s\s*=\s*"([^"]*)"' % key.encode("ascii"),
+                head
+            )
+            if m:
+                info[key] = m.group(1).decode("utf-8", errors="replace")
+    except Exception:
+        pass
     return info
 
 
@@ -189,7 +258,7 @@ def format_date_string(s):
 
 
 # ============================================================
-# 2. КОНФИГ ИЗВЛЕЧЕНИЯ
+# 3. КОНФИГ ИЗВЛЕЧЕНИЯ
 # ============================================================
 
 class ExtractConfig:
@@ -209,15 +278,18 @@ class ExtractConfig:
 
 
 # ============================================================
-# 3. ИЗВЛЕЧЕНИЕ ЗАПИСЕЙ
+# 4. ИЗВЛЕЧЕНИЕ ЗАПИСЕЙ (устойчивое к "" и 30 ГБ)
 # ============================================================
 
 def extract_records(path, record_tag=RECORD_TAG, namespace=None,
                     config=None, descriptions=None,
                     progress_cb=None, cancel_flag=None, max_records=None):
     """
-    Порядок ключей — строго как в XML.
-    Значения из TransData/Field берутся ТОЛЬКО из PreparedValue.
+    Устойчивый потоковый разбор QUIK XML:
+      - читаем файл кусками по 4 МБ;
+      - каждый кусок санитизируем (чиним ""..."" и &);
+      - незакрытые теги на границе склеиваем со следующим куском;
+      - парсер с recover=True и huge_tree=True.
     """
     if config is None:
         config = ExtractConfig()
@@ -226,112 +298,147 @@ def extract_records(path, record_tag=RECORD_TAG, namespace=None,
 
     search_tag = qname(record_tag, namespace)
 
-    with open(path, "rb") as f:
-        context = ET.iterparse(f, events=("end",), tag=search_tag)
+    parser = ET.XMLPullParser(
+        events=("end",),
+        tag=search_tag,
+        recover=True,
+        huge_tree=True,
+        resolve_entities=False,
+        no_network=True,
+    )
 
-        count = 0
-        for _, elem in context:
+    count = 0
+    pending = b""
+
+    with open(path, "rb") as f:
+        while True:
             if cancel_flag and cancel_flag.is_set():
                 return
 
-            rec = {}
+            chunk = f.read(CHUNK_SIZE)
 
-            # 1. Атрибуты Trans
-            for k, v in elem.attrib.items():
-                rec[f"@{strip_ns(k)}"] = v
-
-            # 2. Обход детей Trans в порядке XML
-            for child in elem:
-                if not isinstance(child.tag, str):
-                    continue
-                tag_local = strip_ns(child.tag)
-
-                if tag_local == config.container_tag:
-                    fields = list(child.findall(config.field_tag))
-                    if namespace and not fields:
-                        fields = list(child.findall(
-                            f"{{{namespace}}}{config.field_tag}"))
-
-                    def _num_key(fe):
+            if not chunk:
+                # конец файла — отдаём остаток pending
+                if pending:
+                    cleaned, _ = _sanitize_chunk(pending)
+                    if cleaned:
                         try:
-                            return int(fe.get("Number") or 0)
-                        except ValueError:
-                            return 0
-                    fields.sort(key=_num_key)
+                            parser.feed(cleaned)
+                        except Exception:
+                            pass
+                break
 
-                    for field in fields:
-                        name = (field.get(config.name_attr) or "").strip()
-                        desc = (field.get(config.description_attr) or "").strip()
-                        prepared = (field.get(config.prepared_attr) or "").strip()
+            data = pending + chunk
+            cleaned, pending = _sanitize_chunk(data)
 
-                        if not name:
-                            continue
+            if cleaned:
+                try:
+                    parser.feed(cleaned)
+                except Exception:
+                    # recover=True должен это проглатывать, но на всякий случай
+                    pass
 
-                        if desc and name not in descriptions:
-                            descriptions[name] = desc
+            for _, elem in parser.read_events():
+                if cancel_flag and cancel_flag.is_set():
+                    return
 
-                        display = prepared  # ТОЛЬКО PreparedValue
+                rec = {}
 
-                        if name in rec:
+                # 1. Атрибуты Trans
+                for k, v in elem.attrib.items():
+                    rec[f"@{strip_ns(k)}"] = v
+
+                # 2. Обход детей Trans
+                for child in elem:
+                    if not isinstance(child.tag, str):
+                        continue
+                    tag_local = strip_ns(child.tag)
+
+                    if tag_local == config.container_tag:
+                        fields = list(child.findall(config.field_tag))
+                        if namespace and not fields:
+                            fields = list(child.findall(
+                                f"{{{namespace}}}{config.field_tag}"))
+
+                        def _num_key(fe):
+                            try:
+                                return int(fe.get("Number") or 0)
+                            except ValueError:
+                                return 0
+                        fields.sort(key=_num_key)
+
+                        for field in fields:
+                            name = (field.get(config.name_attr) or "").strip()
+                            desc = (field.get(config.description_attr) or "").strip()
+                            prepared = (field.get(config.prepared_attr) or "").strip()
+
+                            if not name:
+                                continue
+
+                            if desc and name not in descriptions:
+                                descriptions[name] = desc
+
+                            display = prepared
+
+                            if name in rec:
+                                i = 2
+                                while f"{name}_{i}" in rec:
+                                    i += 1
+                                rec[f"{name}_{i}"] = display
+                            else:
+                                rec[name] = display
+                        continue
+
+                    # обычный дочерний узел
+                    text = (child.text or "").strip()
+                    if text:
+                        key = tag_local
+                        if key in rec:
                             i = 2
-                            while f"{name}_{i}" in rec:
+                            while f"{key}_{i}" in rec:
                                 i += 1
-                            rec[f"{name}_{i}"] = display
+                            rec[f"{key}_{i}"] = text
                         else:
-                            rec[name] = display
-                    continue
+                            rec[key] = text
 
-                # обычный дочерний узел — текст, потом атрибуты
-                text = (child.text or "").strip()
-                if text:
-                    key = tag_local
-                    if key in rec:
-                        i = 2
-                        while f"{key}_{i}" in rec:
-                            i += 1
-                        rec[f"{key}_{i}"] = text
-                    else:
-                        rec[key] = text
+                    for ak, av in child.attrib.items():
+                        key = f"{tag_local}.@{strip_ns(ak)}"
+                        if key in rec:
+                            i = 2
+                            while f"{key}_{i}" in rec:
+                                i += 1
+                            rec[f"{key}_{i}"] = av
+                        else:
+                            rec[key] = av
 
-                for ak, av in child.attrib.items():
-                    key = f"{tag_local}.@{strip_ns(ak)}"
-                    if key in rec:
-                        i = 2
-                        while f"{key}_{i}" in rec:
-                            i += 1
-                        rec[f"{key}_{i}"] = av
-                    else:
-                        rec[key] = av
+                yield rec
 
-            yield rec
+                elem.clear()
+                while elem.getprevious() is not None:
+                    del elem.getparent()[0]
 
-            elem.clear()
-            while elem.getprevious() is not None:
-                del elem.getparent()[0]
+                count += 1
+                if progress_cb and count % 1000 == 0:
+                    progress_cb(count)
+                if max_records and count >= max_records:
+                    return
 
-            count += 1
-            if progress_cb and count % 1000 == 0:
-                progress_cb(count)
-            if max_records and count >= max_records:
-                return
+        try:
+            parser.close()
+        except Exception:
+            pass
 
 
 # ============================================================
-# 4. КОЛОНКИ
+# 5. КОЛОНКИ
 # ============================================================
 
 def inject_record_numbers(records):
-    """Проставляет порядковый номер (1, 2, 3, ...) каждой записи."""
     for i, rec in enumerate(records, 1):
         rec[RECORD_NUM_COL] = str(i)
 
 
 def build_card_columns(records, descriptions=None):
-    """
-    Набор колонок для КАРТОЧЕК — все ключи, встречающиеся хотя бы в одной
-    записи (в порядке первого появления). Синтетическая колонка «Запись»
-    в карточках не используется.
-    """
     seen = {}
     for rec in records:
         for k in rec:
@@ -345,14 +452,11 @@ def build_card_columns(records, descriptions=None):
 
 
 def build_table_columns(card_columns):
-    """
-    Колонки для ТАБЛИЦЫ = «Запись» (номер строки) + все колонки из карточек.
-    """
     return [RECORD_NUM_COL] + list(card_columns)
 
 
 # ============================================================
-# 5. HTML
+# 6. HTML
 # ============================================================
 
 HTML_HEAD = """<!DOCTYPE html>
@@ -400,8 +504,6 @@ def export_html(xml_path, out_path, record_tag=RECORD_TAG, namespace=None,
     inject_record_numbers(records)
 
     card_columns, card_header_map = build_card_columns(records, descriptions)
-
-    # Таблица: «Запись» + все колонки из карточек
     table_columns = build_table_columns(card_columns)
     table_header_map = {RECORD_NUM_COL: "Запись"}
     table_header_map.update(card_header_map)
@@ -455,7 +557,7 @@ def export_html(xml_path, out_path, record_tag=RECORD_TAG, namespace=None,
 
 
 # ============================================================
-# 6. PDF
+# 7. PDF
 # ============================================================
 
 def register_cyrillic_font():
@@ -493,18 +595,12 @@ def export_pdf(xml_path, out_path, record_tag=RECORD_TAG, namespace=None,
     inject_record_numbers(records)
 
     card_columns, card_header_map = build_card_columns(records, descriptions)
-
-    # Таблица: «Запись» + все колонки из карточек
     table_columns = build_table_columns(card_columns)
     table_header_map = {RECORD_NUM_COL: "Запись"}
     table_header_map.update(card_header_map)
 
-    # Для подбора формата страницы в таблице считаем с «Записью»
     ncols_table = len(table_columns)
     ncols_cards = len(card_columns)
-
-    # ---- Подбор формата страницы ----
-    # Для карточек ориентируемся на их число полей, для таблицы — на ncols_table
     ncols = ncols_table if not as_cards else ncols_cards
 
     if as_cards or ncols <= 6:
@@ -556,7 +652,6 @@ def export_pdf(xml_path, out_path, record_tag=RECORD_TAG, namespace=None,
         story.append(Paragraph(_esc(line), small))
     story.append(Spacer(1, 8))
 
-    # ---------- КАРТОЧКИ ----------
     if as_cards:
         for i, rec in enumerate(records, 1):
             story.append(Paragraph(f"<b>Запись {i}</b>", normal))
@@ -570,7 +665,6 @@ def export_pdf(xml_path, out_path, record_tag=RECORD_TAG, namespace=None,
         doc.build(story)
         return
 
-    # ---------- ТАБЛИЦА ----------
     data = [[Paragraph(f"<b>{_esc(table_header_map[c])}</b>", normal)
              for c in table_columns]]
     for rec in records:
@@ -598,7 +692,7 @@ def export_pdf(xml_path, out_path, record_tag=RECORD_TAG, namespace=None,
 
 
 # ============================================================
-# 7. GUI
+# 8. GUI
 # ============================================================
 
 class App(tk.Tk):
@@ -619,7 +713,6 @@ class App(tk.Tk):
     def _build_ui(self):
         pad = {"padx": 10, "pady": 8}
 
-        # 1. Файл
         frame_file = ttk.LabelFrame(self, text="1. XML-файл QUIK")
         frame_file.pack(fill="x", **pad)
         ttk.Entry(frame_file, textvariable=self.xml_path, width=70).pack(
@@ -627,7 +720,6 @@ class App(tk.Tk):
         ttk.Button(frame_file, text="Обзор…", command=self.choose_file).pack(
             side="right", padx=6, pady=6)
 
-        # 2. Представление
         frame_view = ttk.LabelFrame(self, text="2. Представление")
         frame_view.pack(fill="x", **pad)
         ttk.Radiobutton(frame_view, text="Карточки",
@@ -637,7 +729,6 @@ class App(tk.Tk):
                         value="table", variable=self.view_mode).pack(
             side="left", padx=16, pady=8)
 
-        # 3. Формат вывода
         frame_fmt = ttk.LabelFrame(self, text="3. Формат вывода")
         frame_fmt.pack(fill="x", **pad)
         for fmt, label in [("html", "HTML"), ("pdf", "PDF")]:
@@ -645,13 +736,11 @@ class App(tk.Tk):
                             variable=self.format_var).pack(
                 side="left", padx=16, pady=8)
 
-        # Прогресс
         frame_prog = ttk.LabelFrame(self, text="Прогресс")
         frame_prog.pack(fill="x", **pad)
         self.progress = ttk.Progressbar(frame_prog, mode="indeterminate")
         self.progress.pack(fill="x", padx=6, pady=8)
 
-        # Кнопки
         frame_btn = ttk.Frame(self)
         frame_btn.pack(fill="x", **pad)
         self.btn_convert = ttk.Button(frame_btn, text="Сформировать отчёт",
