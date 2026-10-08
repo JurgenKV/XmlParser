@@ -6,6 +6,7 @@ import shutil
 import tempfile
 import threading
 import time
+import traceback
 from datetime import datetime
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -45,8 +46,9 @@ QUEUE_DEPTH = 4
 
 FAST_LEN_THRESHOLD = 20
 
-# Оставлять ли временные файлы после работы (для отладки)
-KEEP_TEMP_FILES = False
+# Оставлять ли временные файлы после работы.
+# True — очень полезно при отладке: можно посмотреть months/*.xml
+KEEP_TEMP_FILES = True
 
 RU_MONTHS = [
     "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
@@ -87,7 +89,41 @@ QUIK_NUMERIC_FIELDS = {
 
 
 # ============================================================
-# 0.1. ФОРМАТИРОВАНИЕ ВРЕМЕНИ И МЕСЯЦЕВ
+# 0.1. ЛОГЕР
+# ============================================================
+
+class Logger:
+    """
+    Пишет всё в файл и одновременно в консоль.
+    Файл открывается один раз, чтобы не терять сообщения.
+    """
+    def __init__(self, path):
+        self.path = path
+        self._lock = threading.Lock()
+        self._f = open(path, "w", encoding="utf-8", buffering=1)
+
+    def log(self, msg):
+        ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        line = f"[{ts}] {msg}"
+        with self._lock:
+            try:
+                self._f.write(line + "\n")
+            except Exception:
+                pass
+            try:
+                print(line, flush=True)
+            except Exception:
+                pass
+
+    def close(self):
+        try:
+            self._f.close()
+        except Exception:
+            pass
+
+
+# ============================================================
+# 0.2. ФОРМАТИРОВАНИЕ ВРЕМЕНИ И МЕСЯЦЕВ
 # ============================================================
 
 def fmt_duration(seconds):
@@ -136,12 +172,11 @@ def extract_month_key(rec):
 
 
 # ============================================================
-# 0.2. САНИТИЗАЦИЯ XML
+# 0.3. САНИТИЗАЦИЯ XML
 # ============================================================
 
 _AMP_FIX = re.compile(rb'&(?!amp;|lt;|gt;|quot;|apos;|#\d+;)')
 _BROKEN_QUOTE = re.compile(rb'=""([^"]+)""(?=[\s/>])')
-
 
 
 def _sanitize_tag(tag_bytes):
@@ -250,8 +285,13 @@ def _writer_thread(fo, clean_q, cancel_flag):
         fo.flush()
 
 
-def clean_xml_file(src_path, dst_path, progress_cb=None, cancel_flag=None):
+def clean_xml_file(src_path, dst_path, progress_cb=None,
+                   cancel_flag=None, logger=None):
     total_size = os.path.getsize(src_path)
+
+    if logger:
+        logger.log(f"clean_xml_file: {src_path} -> {dst_path} "
+                   f"({total_size} bytes)")
 
     raw_q = queue.Queue(maxsize=QUEUE_DEPTH)
     clean_q = queue.Queue(maxsize=QUEUE_DEPTH)
@@ -282,9 +322,12 @@ def clean_xml_file(src_path, dst_path, progress_cb=None, cancel_flag=None):
         t_cleaner.join()
         t_reader.join()
 
+    if logger:
+        logger.log("clean_xml_file: done")
+
 
 # ============================================================
-# 0.3. РАЗБИВКА XML ПО МЕСЯЦАМ — ОДИН ПРОХОД
+# 0.4. РАЗБИВКА XML ПО МЕСЯЦАМ — ОДИН ПРОХОД
 # ============================================================
 
 _TRANS_START_RE = re.compile(rb'<Trans(?=[\s>])')
@@ -292,14 +335,12 @@ _TRADE_DATE_RE = re.compile(rb'\bTradeDate\s*=\s*"([^"]*)"')
 
 
 def split_xml_by_month(clean_src_path, split_dir,
-                       progress_cb=None, cancel_flag=None):
-    """
-    Читает clean_src_path (уже очищенный) и режет его на файлы
-    по месяцам — по границам </Trans>.
-
-    Возвращает dict: {ym: {'label': ..., 'path': ..., 'count': N}}
-    """
+                       progress_cb=None, cancel_flag=None,
+                       logger=None):
     os.makedirs(split_dir, exist_ok=True)
+
+    if logger:
+        logger.log(f"split_xml_by_month: {clean_src_path} -> {split_dir}")
 
     with open(clean_src_path, "rb") as f:
         head = f.read(16384)
@@ -313,6 +354,9 @@ def split_xml_by_month(clean_src_path, split_dir,
     preamble = head[:root_open_end]
     closing_tag = b'\n</TransactionsReport>\n'
 
+    if logger:
+        logger.log(f"preamble: {preamble[:200]!r}...")
+
     open_files = {}
 
     def get_writer(ym, label):
@@ -325,6 +369,8 @@ def split_xml_by_month(clean_src_path, split_dir,
             entry = {"fd": fd, "path": path, "label": label,
                      "count": 0}
             open_files[ym] = entry
+            if logger:
+                logger.log(f"  new writer for {ym} ({label}): {path}")
         return entry
 
     total_read = 0
@@ -417,6 +463,13 @@ def split_xml_by_month(clean_src_path, split_dir,
             "path": entry["path"],
             "count": entry["count"],
         }
+        if logger:
+            logger.log(f"  closed {ym}: {entry['count']} records")
+
+    if logger:
+        logger.log(f"split_xml_by_month: {len(result)} months done")
+        logger.log(f"  total records: "
+                   f"{sum(info['count'] for info in result.values())}")
 
     return result
 
@@ -535,6 +588,114 @@ def format_date_string(s):
     if len(s) == 8 and s.isdigit():
         return f"{s[6:8]}.{s[4:6]}.{s[0:4]}"
     return s
+
+
+# ============================================================
+# 1.1. ДИАГНОСТИКА XML-ФАЙЛА
+# ============================================================
+
+def diagnose_xml_error(xml_path, error, logger):
+    """
+    При ошибке XMLSyntaxError печатает:
+      - имя файла;
+      - строку/колонку;
+      - саму строку и фрагмент вокруг;
+      - байты вокруг проблемного места.
+    Возвращает строку с диагностикой (для окна сообщения).
+    """
+    lines_report = []
+    lines_report.append(f"Файл: {xml_path}")
+    lines_report.append(f"Ошибка: {error}")
+
+    entries = list(getattr(error, "error_log", []) or [])
+    if not entries:
+        # пробуем распарсить текст ошибки регуляркой
+        m = re.search(r'line (\d+), column (\d+)', str(error))
+        if m:
+            entries = [type("E", (), {
+                "line": int(m.group(1)),
+                "column": int(m.group(2)),
+                "message": str(error),
+            })()]
+
+    # читаем файл целиком как байты (файл-месяц небольшой)
+    try:
+        with open(xml_path, "rb") as f:
+            data = f.read()
+    except Exception as exc:
+        lines_report.append(f"Не удалось прочитать файл: {exc}")
+        return "\n".join(lines_report)
+
+    all_lines = data.split(b"\n")
+
+    for e in entries[:5]:
+        ln = e.line
+        col = e.column
+        msg = e.message
+        lines_report.append("")
+        lines_report.append(f"--- Ошибка на строке {ln}, "
+                            f"колонке {col}: {msg} ---")
+
+        if 1 <= ln <= len(all_lines):
+            raw = all_lines[ln - 1]
+            # текстовый вид
+            try:
+                txt = raw.decode("cp1251", errors="replace")
+            except Exception:
+                txt = raw.decode("utf-8", errors="replace")
+
+            # показываем от колонки -40 до колонки +40
+            col0 = max(0, (col or 1) - 1)
+            left = max(0, col0 - 40)
+            right = min(len(txt), col0 + 40)
+
+            lines_report.append(f"  строка (срез {left}..{right}):")
+            lines_report.append(f"    ...{txt[left:right]}...")
+            lines_report.append(f"  байты вокруг (hex):")
+            try:
+                hex_slice = raw[max(0, col0 - 20): col0 + 20]
+                lines_report.append(f"    {hex_slice.hex(' ')}")
+            except Exception:
+                pass
+
+            # текст с подсветкой "↑"
+            caret_pos = col0 - left
+            lines_report.append(f"    {' ' * caret_pos}^")
+
+            # полная строка (обрезаем если больше 500)
+            if len(txt) > 500:
+                lines_report.append(f"  полная строка (первые 500):")
+                lines_report.append(f"    {txt[:500]}")
+            else:
+                lines_report.append(f"  полная строка:")
+                lines_report.append(f"    {txt}")
+
+            # контекст — 3 строки до и 3 после
+            lines_report.append(f"  контекст:")
+            for i in range(max(1, ln - 3), min(len(all_lines), ln + 3) + 1):
+                raw_i = all_lines[i - 1]
+                try:
+                    t_i = raw_i.decode("cp1251", errors="replace")
+                except Exception:
+                    t_i = raw_i.decode("utf-8", errors="replace")
+                if len(t_i) > 200:
+                    t_i = t_i[:200] + "..."
+                marker = ">>>" if i == ln else "   "
+                lines_report.append(f"    {marker} {i:>6}: {t_i}")
+        else:
+            lines_report.append("  (не удалось найти эту строку)")
+
+    text = "\n".join(lines_report)
+
+    if logger:
+        logger.log("=" * 60)
+        logger.log("XML SYNTAX ERROR")
+        logger.log("=" * 60)
+        for line in lines_report:
+            logger.log(line)
+        logger.log("=" * 60)
+
+    return text
 
 
 # ============================================================
@@ -709,7 +870,8 @@ HTML_HEAD = """<!DOCTYPE html>
 def export_html_month(out_path, month_label, records_iter,
                       card_columns, card_header_map,
                       header, started_at, finished_at,
-                      as_cards, progress_cb=None, cancel_flag=None):
+                      as_cards, progress_cb=None, cancel_flag=None,
+                      logger=None):
     table_columns = build_table_columns(card_columns)
     table_header_map = {RECORD_NUM_COL: "Запись"}
     table_header_map.update(card_header_map)
@@ -721,6 +883,9 @@ def export_html_month(out_path, month_label, records_iter,
 
     title = f"Отчёт по транзакциям QUIK — {month_label}"
     count = 0
+
+    if logger:
+        logger.log(f"  export_html_month: {out_path} ({month_label})")
 
     meta_lines = [
         f"Дата формирования: {now.strftime('%d.%m.%Y %H:%M:%S')}",
@@ -758,6 +923,8 @@ def export_html_month(out_path, month_label, records_iter,
                 f.write("</div>\n")
                 if progress_cb and count % 5000 == 0:
                     progress_cb(count)
+                    if logger:
+                        logger.log(f"    {month_label}: {count} records")
         else:
             f.write("<table><thead><tr>")
             for col in table_columns:
@@ -779,9 +946,14 @@ def export_html_month(out_path, month_label, records_iter,
                 f.write("</tr>\n")
                 if progress_cb and count % 5000 == 0:
                     progress_cb(count)
+                    if logger:
+                        logger.log(f"    {month_label}: {count} records")
             f.write("</tbody></table>\n")
 
         f.write("</body></html>\n")
+
+    if logger:
+        logger.log(f"  export_html_month done: {count} records")
 
     return count
 
@@ -860,7 +1032,8 @@ def _calc_row_height(row_values, table_columns, col_widths,
 def export_pdf_month(out_path, month_label, records_iter,
                      card_columns, card_header_map,
                      header, started_at, finished_at,
-                     as_cards, progress_cb=None, cancel_flag=None):
+                     as_cards, progress_cb=None, cancel_flag=None,
+                     logger=None):
     font = register_cyrillic_font()
 
     table_columns = build_table_columns(card_columns)
@@ -907,6 +1080,10 @@ def export_pdf_month(out_path, month_label, records_iter,
     c = rl_canvas.Canvas(out_path, pagesize=pagesize)
     title_text = f"Отчёт по транзакциям QUIK — {month_label}"
     c.setTitle(title_text)
+
+    if logger:
+        logger.log(f"  export_pdf_month: {out_path} ({month_label}), "
+                   f"cols={ncols}, page={pagesize}")
 
     now = datetime.now()
     started_at = started_at or now
@@ -1025,9 +1202,13 @@ def export_pdf_month(out_path, month_label, records_iter,
 
             if progress_cb and count % 5000 == 0:
                 progress_cb(count)
+                if logger:
+                    logger.log(f"    {month_label}: {count} records")
 
         c.showPage()
         c.save()
+        if logger:
+            logger.log(f"  export_pdf_month done: {count} records")
         return count
 
     page_y = draw_report_header(True)
@@ -1078,9 +1259,13 @@ def export_pdf_month(out_path, month_label, records_iter,
 
         if progress_cb and count % 5000 == 0:
             progress_cb(count)
+            if logger:
+                logger.log(f"    {month_label}: {count} records")
 
     c.showPage()
     c.save()
+    if logger:
+        logger.log(f"  export_pdf_month done: {count} records")
     return count
 
 
@@ -1131,11 +1316,9 @@ class App(tk.Tk):
                             variable=self.format_var).pack(
                 side="left", padx=16, pady=8)
 
-        # ─── Блок времени и целостности ───
         frame_time = ttk.LabelFrame(self, text="Время и целостность")
         frame_time.pack(fill="x", **pad)
 
-        # Левая колонка — время
         time_left = ttk.Frame(frame_time)
         time_left.grid(row=0, column=0, sticky="nw", padx=6, pady=3)
 
@@ -1154,11 +1337,9 @@ class App(tk.Tk):
         self.lbl_elapsed = ttk.Label(time_left, text="—")
         self.lbl_elapsed.grid(row=2, column=1, sticky="w", padx=4, pady=2)
 
-        # Разделитель
         ttk.Separator(frame_time, orient="vertical").grid(
             row=0, column=1, sticky="ns", padx=12, pady=4)
 
-        # Правая колонка — целостность
         time_right = ttk.Frame(frame_time)
         time_right.grid(row=0, column=2, sticky="nw", padx=6, pady=3)
 
@@ -1287,10 +1468,23 @@ class App(tk.Tk):
 
         def worker():
             work_dir = None
+            logger = None
             try:
                 src_dir = os.path.dirname(os.path.abspath(xml_file))
                 work_dir = tempfile.mkdtemp(
                     prefix="quik_work_", dir=src_dir)
+
+                log_path = os.path.join(work_dir, "debug.log")
+                logger = Logger(log_path)
+
+                logger.log("=" * 60)
+                logger.log("START")
+                logger.log(f"  src: {xml_file}")
+                logger.log(f"  out: {out_path}")
+                logger.log(f"  fmt: {fmt}, view: {'cards' if as_cards else 'table'}")
+                logger.log(f"  work_dir: {work_dir}")
+                logger.log(f"  KEEP_TEMP_FILES: {KEEP_TEMP_FILES}")
+                logger.log("=" * 60)
 
                 clean_path = os.path.join(work_dir, "clean.xml")
                 split_dir = os.path.join(work_dir, "months")
@@ -1298,10 +1492,12 @@ class App(tk.Tk):
 
                 # ─── ЭТАП 1: очистка XML ───
                 self._set_status("Этап 1/3: очистка XML…", "blue")
+                logger.log("ЭТАП 1: очистка XML")
                 clean_xml_file(
                     xml_file, clean_path,
                     progress_cb=self._clean_progress_cb,
-                    cancel_flag=self.cancel_flag)
+                    cancel_flag=self.cancel_flag,
+                    logger=logger)
 
                 if self.cancel_flag.is_set():
                     raise RuntimeError("Отменено")
@@ -1309,11 +1505,13 @@ class App(tk.Tk):
                 # ─── ЭТАП 2: резка по месяцам ───
                 self._set_status(
                     "Этап 2/3: резка XML по месяцам…", "blue")
+                logger.log("ЭТАП 2: резка по месяцам")
 
                 months_info = split_xml_by_month(
                     clean_path, split_dir,
                     progress_cb=self._split_progress_cb,
-                    cancel_flag=self.cancel_flag)
+                    cancel_flag=self.cancel_flag,
+                    logger=logger)
 
                 if self.cancel_flag.is_set():
                     raise RuntimeError("Отменено")
@@ -1322,9 +1520,14 @@ class App(tk.Tk):
                     raise RuntimeError(
                         "В файле не найдено ни одной транзакции.")
 
-                # Сумма записей по месяцам = сколько записей в исходном XML
                 total_in_xml = sum(info["count"]
                                    for info in months_info.values())
+                logger.log(f"Всего записей в XML: {total_in_xml}")
+                for ym in sorted(months_info.keys()):
+                    info = months_info[ym]
+                    logger.log(f"  {ym} ({info['label']}): "
+                               f"{info['count']} records, "
+                               f"file={info['path']}")
 
                 self.after(0, lambda: self.lbl_total_xml.config(
                     text=f"{total_in_xml:,}".replace(",", " "),
@@ -1339,6 +1542,8 @@ class App(tk.Tk):
                 first_month_path = list(months_info.values())[0]["path"]
                 namespace = detect_namespace(first_month_path)
                 header = read_report_header(first_month_path)
+                logger.log(f"namespace: {namespace}")
+                logger.log(f"header: {header}")
 
                 sample_seen = {}
                 sample_desc = {}
@@ -1353,16 +1558,21 @@ class App(tk.Tk):
                         if k not in sample_seen:
                             sample_seen[k] = True
 
+                logger.log(f"sample cols: {len(sample_seen)}")
+                logger.log(f"  {list(sample_seen.keys())}")
+
                 card_columns, card_header_map = build_columns_from_seen(
                     sample_seen, sample_desc)
 
                 # ─── ЭТАП 3: генерация отчётов ───
+                logger.log("ЭТАП 3: генерация отчётов")
                 out_dir_base = os.path.dirname(os.path.abspath(out_path))
                 base_name = os.path.splitext(
                     os.path.basename(out_path))[0]
                 reports_dir = os.path.join(out_dir_base,
                                            f"{base_name}_reports")
                 os.makedirs(reports_dir, exist_ok=True)
+                logger.log(f"reports_dir: {reports_dir}")
 
                 months_sorted = sorted(months_info.keys())
                 K = len(months_sorted)
@@ -1378,6 +1588,9 @@ class App(tk.Tk):
                     file_name = f"{base_name}_{month_label}.{ext}"
                     file_path = os.path.join(reports_dir, file_name)
 
+                    logger.log(f"[{i}/{K}] {ym} — {month_label} "
+                               f"({info['count']} records)")
+
                     self._set_status(
                         f"Этап 3/3: {i}/{K} — {month_label} "
                         f"({info['count']} записей)…", "blue")
@@ -1391,27 +1604,61 @@ class App(tk.Tk):
 
                     finished_at = datetime.now()
 
-                    if fmt == "html":
-                        count = export_html_month(
-                            file_path, month_label, records_iter,
-                            card_columns, card_header_map,
-                            header, started_at, finished_at,
-                            as_cards=as_cards,
-                            progress_cb=self._progress_cb,
-                            cancel_flag=self.cancel_flag)
-                    else:
-                        count = export_pdf_month(
-                            file_path, month_label, records_iter,
-                            card_columns, card_header_map,
-                            header, started_at, finished_at,
-                            as_cards=as_cards,
-                            progress_cb=self._progress_cb,
-                            cancel_flag=self.cancel_flag)
+                    try:
+                        if fmt == "html":
+                            count = export_html_month(
+                                file_path, month_label, records_iter,
+                                card_columns, card_header_map,
+                                header, started_at, finished_at,
+                                as_cards=as_cards,
+                                progress_cb=self._progress_cb,
+                                cancel_flag=self.cancel_flag,
+                                logger=logger)
+                        else:
+                            count = export_pdf_month(
+                                file_path, month_label, records_iter,
+                                card_columns, card_header_map,
+                                header, started_at, finished_at,
+                                as_cards=as_cards,
+                                progress_cb=self._progress_cb,
+                                cancel_flag=self.cancel_flag,
+                                logger=logger)
 
-                    written.append((file_path, count))
+                        written.append((file_path, count))
+                        logger.log(f"  [{i}/{K}] done: {count} records")
 
-                # Сумма записей в отчётах
-                total_in_reports = sum(c for _, c in written)
+                    except ET.XMLSyntaxError as xml_exc:
+                        # ─── диагностика ───
+                        diag = diagnose_xml_error(month_path, xml_exc,
+                                                  logger)
+                        # сохраняем битый файл в постоянное место,
+                        # чтобы пользователь мог его открыть
+                        saved_path = os.path.join(
+                            reports_dir,
+                            f"__ERROR___{ym}.xml")
+                        try:
+                            shutil.copy2(month_path, saved_path)
+                        except Exception:
+                            saved_path = month_path
+
+                        msg = (f"Ошибка XML в месяце {month_label} "
+                               f"({ym}).\n\n"
+                               f"Файл: {saved_path}\n\n"
+                               f"Диагностика:\n{diag}\n\n"
+                               f"Лог: {log_path}")
+                        logger.log("!!! XMLSyntaxError !!!")
+                        logger.log(msg)
+
+                        # отдаём в UI подробную диагностику
+                        def show_err(m=msg):
+                            self._show_error("Ошибка XML", m)
+                        self.after(0, show_err)
+                        # продолжаем со следующим месяцем,
+                        # либо можно прервать — сейчас продолжаем
+                        written.append((file_path, -1))
+                        continue
+
+                total_in_reports = sum(c for _, c in written if c >= 0)
 
                 def update_integrity():
                     self.lbl_total_reports.config(
@@ -1441,6 +1688,10 @@ class App(tk.Tk):
 
                 self.after(0, apply_end)
 
+                logger.log(f"total_in_xml: {total_in_xml}")
+                logger.log(f"total_in_reports: {total_in_reports}")
+                logger.log(f"total_time: {fmt_duration(total_time)}")
+
                 if not written:
                     raise RuntimeError("Отчёты не сформированы (отменено)")
 
@@ -1457,6 +1708,7 @@ class App(tk.Tk):
                 msg_lines.append("")
                 msg_lines.append(f"Месяцев: {len(written)}")
                 msg_lines.append(f"Папка: {reports_dir}")
+                msg_lines.append(f"Лог: {log_path}")
                 msg_lines.append("")
                 for p, c in written[:15]:
                     msg_lines.append(
@@ -1471,6 +1723,12 @@ class App(tk.Tk):
 
             except Exception as exc:
                 err = f"{type(exc).__name__}: {exc}"
+                if logger:
+                    logger.log("!!!" * 20)
+                    logger.log("ОБЩАЯ ОШИБКА")
+                    logger.log(traceback.format_exc())
+                    logger.log("!!!" * 20)
+
                 self._end_time = time.time()
                 end_dt = datetime.now()
                 total_time = self._end_time - self._start_time
@@ -1484,6 +1742,10 @@ class App(tk.Tk):
                 self.after(0, self._show_error, "Ошибка", err)
 
             finally:
+                if logger:
+                    logger.log("FINISHED")
+                    logger.close()
+
                 if work_dir and os.path.exists(work_dir):
                     if KEEP_TEMP_FILES:
                         print(f"[DEBUG] Временные файлы в: {work_dir}")
