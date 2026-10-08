@@ -167,8 +167,13 @@ def extract_month_key(rec):
 # ============================================================
 
 _AMP_FIX = re.compile(rb'&(?!amp;|lt;|gt;|quot;|apos;|#\d+;)')
+
+# =""X""  — лишняя кавычка в НАЧАЛЕ значения
 _BROKEN_QUOTE = re.compile(rb'=""([^"]+)""(?=[\s/>])')
-_MULTI_QUOTES = re.compile(rb'"+(?=[\s/>])')
+
+# ="...=""  — лишняя кавычка в КОНЦЕ значения
+# Пример: ClientCode="N=""   ->  ClientCode="N=&quot;"
+_EXTRA_TRAILING_QUOTE = re.compile(rb'(="[^"]*?)""(?=[\s/>])')
 
 _INVALID_XML_BYTES = bytes(
     b for b in range(0x20)
@@ -178,16 +183,18 @@ _INVALID_BYTE_RE = re.compile(
     rb'[' + re.escape(_INVALID_XML_BYTES) + rb']'
 )
 
-# ─── Умные кавычки/тире cp1251 -> ASCII-эквиваленты ───
-# Заменяем, чтобы получились корректные кавычки/дефисы,
-# а не удаляем.
+# ─── Умные кавычки и тире cp1251 — ПРОСТО УДАЛЯЕМ ───
+# 0x91 ‘  0x92 ’  0x93 “  0x94 ”  0x96 –  0x97 —
+# Эти символы ломают границы атрибутов в QUIK-отчётах
+# (парсер видит внутри значения обычную кавычку, хотя
+# это другой байт), поэтому безопаснее от них избавиться.
 _SMART_CHARS_MAP = {
-    0x91: b"'",   # ‘
-    0x92: b"'",   # ’
-    0x93: b'"',   # “
-    0x94: b'"',   # ”
-    0x96: b'-',   # –
-    0x97: b'-',   # —
+    0x91: b"",
+    0x92: b"",
+    0x93: b"",
+    0x94: b"",
+    0x96: b"",
+    0x97: b"",
 }
 _SMART_CHARS_RE = re.compile(
     b'[' + bytes(_SMART_CHARS_MAP.keys()) + b']'
@@ -208,7 +215,7 @@ def _fix_smart_quotes(data: bytes) -> bytes:
 
 
 def _sanitize_tag(tag_bytes):
-    # 0) умные кавычки/тире -> ASCII " / ' / -
+    # 0) умные кавычки/тире — просто удаляем
     tag_bytes = _fix_smart_quotes(tag_bytes)
 
     # 1) невалидные управляющие байты — удаляем
@@ -219,14 +226,17 @@ def _sanitize_tag(tag_bytes):
     if b'&' in tag_bytes:
         tag_bytes = _AMP_FIX.sub(b'&amp;', tag_bytes)
 
-    # 3) =""X"" -> ="&quot;X&quot;"
+    # 3) =""X""  ->  ="&quot;X&quot;"
     if b'=""' in tag_bytes:
         tag_bytes = _BROKEN_QUOTE.sub(
             rb'="&quot;\1&quot;"', tag_bytes)
 
-    # 4) каскад кавычек перед концом тега -> одна
+    # 3б) ="...=""  ->  ="...=&quot;"
+    # Лишняя хвостовая кавычка внутри значения атрибута:
+    # ClientCode="N=""   ->   ClientCode="N=&quot;"
     if b'""' in tag_bytes:
-        tag_bytes = _MULTI_QUOTES.sub(b'"', tag_bytes)
+        tag_bytes = _EXTRA_TRAILING_QUOTE.sub(
+            rb'\1&quot;"', tag_bytes)
 
     return tag_bytes
 
@@ -279,8 +289,9 @@ def _process_clean_data(raw, final):
 
         tag = raw[lt:gt + 1]
 
+        # Проверяем любые двойные кавычки подряд — этого достаточно,
+        # чтобы отловить и `=""X""`, и `="...=""` одновременно.
         if (b'&' in tag
-                or b'=""' in tag
                 or b'""' in tag
                 or _INVALID_BYTE_RE.search(tag)
                 or _SMART_CHARS_RE.search(tag)):
