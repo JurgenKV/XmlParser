@@ -175,19 +175,55 @@ def extract_month_key(rec):
 # 0.3. САНИТИЗАЦИЯ XML
 # ============================================================
 
+# --- Регулярки для сломанных кавычек и & ---
 _AMP_FIX = re.compile(rb'&(?!amp;|lt;|gt;|quot;|apos;|#\d+;)')
 _BROKEN_QUOTE = re.compile(rb'=""([^"]+)""(?=[\s/>])')
 
+# --- Регулярка для невалидных управляющих байтов ---
+# В XML 1.0 разрешены только: 0x09 (TAB), 0x0A (LF), 0x0D (CR).
+# Всё остальное в диапазоне 0x00–0x1F — запрещено.
+_INVALID_XML_BYTES = bytes(
+    b for b in range(0x20)
+    if b not in (0x09, 0x0A, 0x0D)
+)
+_INVALID_BYTE_RE = re.compile(
+    rb'[' + re.escape(_INVALID_XML_BYTES) + rb']'
+)
+
 
 def _sanitize_tag(tag_bytes):
+    """
+    Чистит один тег:
+      1. УДАЛЯЕТ запрещённые управляющие байты (0x00–0x08, 0x0B, 0x0C,
+         0x0E–0x1F). Именно они часто приводят к
+         "attributes construct error" в QUIK-отчётах.
+      2. Экранирует неэкранированные & -> &amp;
+      3. Чинит сломанные кавычки =""X"" -> ="&quot;X&quot;"
+    """
+    # 1) удаляем запрещённые управляющие байты
+    if _INVALID_BYTE_RE.search(tag_bytes):
+        tag_bytes = _INVALID_BYTE_RE.sub(b'', tag_bytes)
+
+    # 2) & -> &amp;
     if b'&' in tag_bytes:
         tag_bytes = _AMP_FIX.sub(b'&amp;', tag_bytes)
+
+    # 3) сломанные кавычки
     if b'=""' in tag_bytes:
-        tag_bytes = _BROKEN_QUOTE.sub(rb'="&quot;\1&quot;"', tag_bytes)
+        tag_bytes = _BROKEN_QUOTE.sub(
+            rb'="&quot;\1&quot;"', tag_bytes)
+
     return tag_bytes
 
 
 def _process_clean_data(raw, final):
+    """
+    Чистит кусок XML:
+      - внутри тегов: удаляем управляющие байты, экранируем &,
+        чиним сломанные кавычки;
+      - вне тегов (в текстовых узлах): удаляем запрещённые
+        управляющие байты.
+    """
     out = bytearray()
     pos = 0
     n = len(raw)
@@ -195,11 +231,20 @@ def _process_clean_data(raw, final):
     while pos < n:
         lt = raw.find(b'<', pos)
         if lt == -1:
-            out.extend(raw[pos:])
+            # текст до конца чанка — чистим управляющие байты
+            tail = raw[pos:]
+            if _INVALID_BYTE_RE.search(tail):
+                tail = _INVALID_BYTE_RE.sub(b'', tail)
+            out.extend(tail)
             return bytes(out), b""
 
-        out.extend(raw[pos:lt])
+        # текст между прошлым тегом и текущим '<'
+        text_chunk = raw[pos:lt]
+        if _INVALID_BYTE_RE.search(text_chunk):
+            text_chunk = _INVALID_BYTE_RE.sub(b'', text_chunk)
+        out.extend(text_chunk)
 
+        # комментарий — не трогаем
         if raw[lt:lt + 4] == b'<!--':
             end = raw.find(b'-->', lt)
             if end == -1:
@@ -208,6 +253,7 @@ def _process_clean_data(raw, final):
             pos = end + 3
             continue
 
+        # CDATA — не трогаем
         if raw[lt:lt + 9] == b'<![CDATA[':
             end = raw.find(b']]>', lt)
             if end == -1:
@@ -216,15 +262,24 @@ def _process_clean_data(raw, final):
             pos = end + 3
             continue
 
+        # обычный тег — ищем закрывающий '>'
         gt = raw.find(b'>', lt)
         if gt == -1:
             if final:
-                out.extend(raw[lt:])
+                # хвост не закрылся, но это конец файла —
+                # всё равно чистим как тег
+                tag = raw[lt:]
+                tag = _sanitize_tag(tag)
+                out.extend(tag)
                 return bytes(out), b""
+            # тег не влез в чанк — переносим на следующий
             return bytes(out), raw[lt:]
 
         tag = raw[lt:gt + 1]
-        if b'&' in tag or b'=""' in tag:
+
+        # быстрая проверка: есть ли что чистить
+        if (b'&' in tag or b'=""' in tag
+                or _INVALID_BYTE_RE.search(tag)):
             tag = _sanitize_tag(tag)
 
         out.extend(tag)
@@ -609,7 +664,6 @@ def diagnose_xml_error(xml_path, error, logger):
 
     entries = list(getattr(error, "error_log", []) or [])
     if not entries:
-        # пробуем распарсить текст ошибки регуляркой
         m = re.search(r'line (\d+), column (\d+)', str(error))
         if m:
             entries = [type("E", (), {
@@ -618,7 +672,6 @@ def diagnose_xml_error(xml_path, error, logger):
                 "message": str(error),
             })()]
 
-    # читаем файл целиком как байты (файл-месяц небольшой)
     try:
         with open(xml_path, "rb") as f:
             data = f.read()
@@ -638,13 +691,11 @@ def diagnose_xml_error(xml_path, error, logger):
 
         if 1 <= ln <= len(all_lines):
             raw = all_lines[ln - 1]
-            # текстовый вид
             try:
                 txt = raw.decode("cp1251", errors="replace")
             except Exception:
                 txt = raw.decode("utf-8", errors="replace")
 
-            # показываем от колонки -40 до колонки +40
             col0 = max(0, (col or 1) - 1)
             left = max(0, col0 - 40)
             right = min(len(txt), col0 + 40)
@@ -658,11 +709,9 @@ def diagnose_xml_error(xml_path, error, logger):
             except Exception:
                 pass
 
-            # текст с подсветкой "↑"
             caret_pos = col0 - left
             lines_report.append(f"    {' ' * caret_pos}^")
 
-            # полная строка (обрезаем если больше 500)
             if len(txt) > 500:
                 lines_report.append(f"  полная строка (первые 500):")
                 lines_report.append(f"    {txt[:500]}")
@@ -670,9 +719,9 @@ def diagnose_xml_error(xml_path, error, logger):
                 lines_report.append(f"  полная строка:")
                 lines_report.append(f"    {txt}")
 
-            # контекст — 3 строки до и 3 после
             lines_report.append(f"  контекст:")
-            for i in range(max(1, ln - 3), min(len(all_lines), ln + 3) + 1):
+            for i in range(max(1, ln - 3),
+                           min(len(all_lines), ln + 3) + 1):
                 raw_i = all_lines[i - 1]
                 try:
                     t_i = raw_i.decode("cp1251", errors="replace")
@@ -1628,11 +1677,8 @@ class App(tk.Tk):
                         logger.log(f"  [{i}/{K}] done: {count} records")
 
                     except ET.XMLSyntaxError as xml_exc:
-                        # ─── диагностика ───
                         diag = diagnose_xml_error(month_path, xml_exc,
                                                   logger)
-                        # сохраняем битый файл в постоянное место,
-                        # чтобы пользователь мог его открыть
                         saved_path = os.path.join(
                             reports_dir,
                             f"__ERROR___{ym}.xml")
@@ -1649,12 +1695,9 @@ class App(tk.Tk):
                         logger.log("!!! XMLSyntaxError !!!")
                         logger.log(msg)
 
-                        # отдаём в UI подробную диагностику
                         def show_err(m=msg):
                             self._show_error("Ошибка XML", m)
                         self.after(0, show_err)
-                        # продолжаем со следующим месяцем,
-                        # либо можно прервать — сейчас продолжаем
                         written.append((file_path, -1))
                         continue
 
