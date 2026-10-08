@@ -46,10 +46,6 @@ QUEUE_DEPTH = 4
 
 FAST_LEN_THRESHOLD = 20
 
-# Оставлять ли временные файлы после работы.
-# True — очень полезно при отладке: можно посмотреть months/*.xml
-KEEP_TEMP_FILES = True
-
 RU_MONTHS = [
     "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
     "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь",
@@ -93,10 +89,6 @@ QUIK_NUMERIC_FIELDS = {
 # ============================================================
 
 class Logger:
-    """
-    Пишет всё в файл и одновременно в консоль.
-    Файл открывается один раз, чтобы не терять сообщения.
-    """
     def __init__(self, path):
         self.path = path
         self._lock = threading.Lock()
@@ -141,7 +133,6 @@ def fmt_duration(seconds):
 
 
 def date_str_to_month(d):
-    """'2019-06-04' или '20190604' → ('2019-06', '2019_Июнь')."""
     d = (d or "").strip()
 
     if len(d) == 10 and d[4] == "-" and d[7] == "-":
@@ -175,13 +166,9 @@ def extract_month_key(rec):
 # 0.3. САНИТИЗАЦИЯ XML
 # ============================================================
 
-# --- Регулярки для сломанных кавычек и & ---
 _AMP_FIX = re.compile(rb'&(?!amp;|lt;|gt;|quot;|apos;|#\d+;)')
 _BROKEN_QUOTE = re.compile(rb'=""([^"]+)""(?=[\s/>])')
 
-# --- Регулярка для невалидных управляющих байтов ---
-# В XML 1.0 разрешены только: 0x09 (TAB), 0x0A (LF), 0x0D (CR).
-# Всё остальное в диапазоне 0x00–0x1F — запрещено.
 _INVALID_XML_BYTES = bytes(
     b for b in range(0x20)
     if b not in (0x09, 0x0A, 0x0D)
@@ -192,23 +179,12 @@ _INVALID_BYTE_RE = re.compile(
 
 
 def _sanitize_tag(tag_bytes):
-    """
-    Чистит один тег:
-      1. УДАЛЯЕТ запрещённые управляющие байты (0x00–0x08, 0x0B, 0x0C,
-         0x0E–0x1F). Именно они часто приводят к
-         "attributes construct error" в QUIK-отчётах.
-      2. Экранирует неэкранированные & -> &amp;
-      3. Чинит сломанные кавычки =""X"" -> ="&quot;X&quot;"
-    """
-    # 1) удаляем запрещённые управляющие байты
     if _INVALID_BYTE_RE.search(tag_bytes):
         tag_bytes = _INVALID_BYTE_RE.sub(b'', tag_bytes)
 
-    # 2) & -> &amp;
     if b'&' in tag_bytes:
         tag_bytes = _AMP_FIX.sub(b'&amp;', tag_bytes)
 
-    # 3) сломанные кавычки
     if b'=""' in tag_bytes:
         tag_bytes = _BROKEN_QUOTE.sub(
             rb'="&quot;\1&quot;"', tag_bytes)
@@ -217,13 +193,6 @@ def _sanitize_tag(tag_bytes):
 
 
 def _process_clean_data(raw, final):
-    """
-    Чистит кусок XML:
-      - внутри тегов: удаляем управляющие байты, экранируем &,
-        чиним сломанные кавычки;
-      - вне тегов (в текстовых узлах): удаляем запрещённые
-        управляющие байты.
-    """
     out = bytearray()
     pos = 0
     n = len(raw)
@@ -231,20 +200,17 @@ def _process_clean_data(raw, final):
     while pos < n:
         lt = raw.find(b'<', pos)
         if lt == -1:
-            # текст до конца чанка — чистим управляющие байты
             tail = raw[pos:]
             if _INVALID_BYTE_RE.search(tail):
                 tail = _INVALID_BYTE_RE.sub(b'', tail)
             out.extend(tail)
             return bytes(out), b""
 
-        # текст между прошлым тегом и текущим '<'
         text_chunk = raw[pos:lt]
         if _INVALID_BYTE_RE.search(text_chunk):
             text_chunk = _INVALID_BYTE_RE.sub(b'', text_chunk)
         out.extend(text_chunk)
 
-        # комментарий — не трогаем
         if raw[lt:lt + 4] == b'<!--':
             end = raw.find(b'-->', lt)
             if end == -1:
@@ -253,7 +219,6 @@ def _process_clean_data(raw, final):
             pos = end + 3
             continue
 
-        # CDATA — не трогаем
         if raw[lt:lt + 9] == b'<![CDATA[':
             end = raw.find(b']]>', lt)
             if end == -1:
@@ -262,22 +227,17 @@ def _process_clean_data(raw, final):
             pos = end + 3
             continue
 
-        # обычный тег — ищем закрывающий '>'
         gt = raw.find(b'>', lt)
         if gt == -1:
             if final:
-                # хвост не закрылся, но это конец файла —
-                # всё равно чистим как тег
                 tag = raw[lt:]
                 tag = _sanitize_tag(tag)
                 out.extend(tag)
                 return bytes(out), b""
-            # тег не влез в чанк — переносим на следующий
             return bytes(out), raw[lt:]
 
         tag = raw[lt:gt + 1]
 
-        # быстрая проверка: есть ли что чистить
         if (b'&' in tag or b'=""' in tag
                 or _INVALID_BYTE_RE.search(tag)):
             tag = _sanitize_tag(tag)
@@ -650,14 +610,6 @@ def format_date_string(s):
 # ============================================================
 
 def diagnose_xml_error(xml_path, error, logger):
-    """
-    При ошибке XMLSyntaxError печатает:
-      - имя файла;
-      - строку/колонку;
-      - саму строку и фрагмент вокруг;
-      - байты вокруг проблемного места.
-    Возвращает строку с диагностикой (для окна сообщения).
-    """
     lines_report = []
     lines_report.append(f"Файл: {xml_path}")
     lines_report.append(f"Ошибка: {error}")
@@ -1067,7 +1019,6 @@ def _calc_row_height(row_values, table_columns, col_widths,
                      font_name, font_size, line_h):
     wrapped = {}
     max_lines = 1
-
     for col, w in zip(table_columns, col_widths):
         val = row_values.get(col, "")
         lines = _wrap_text(val, font_name, font_size, w - 4)
@@ -1326,12 +1277,16 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("QUIK XML → отчёты по месяцам (HTML / PDF)")
-        self.geometry("860x640")
+        self.geometry("880x700")
         self.resizable(False, False)
 
         self.xml_path = tk.StringVar()
         self.format_var = tk.StringVar(value="html")
         self.view_mode = tk.StringVar(value="cards")
+
+        # Чекбоксы
+        self.delete_temp_files = tk.BooleanVar(value=True)   # по умолчанию удалять
+        self.save_bad_files = tk.BooleanVar(value=True)      # по умолчанию сохранять битые
 
         self.cancel_flag = threading.Event()
         self._start_time = None
@@ -1365,7 +1320,25 @@ class App(tk.Tk):
                             variable=self.format_var).pack(
                 side="left", padx=16, pady=8)
 
-        frame_time = ttk.LabelFrame(self, text="Время и целостность")
+        # ─── Чекбоксы настроек ───
+        frame_opts = ttk.LabelFrame(self, text="4. Опции обработки")
+        frame_opts.pack(fill="x", **pad)
+
+        ttk.Checkbutton(
+            frame_opts,
+            text="Удалять временные файлы после работы",
+            variable=self.delete_temp_files,
+        ).pack(anchor="w", padx=10, pady=4)
+
+        ttk.Checkbutton(
+            frame_opts,
+            text="Сохранять битый XML-файл при ошибке "
+                 "(__ERROR__YYYY-MM.xml)",
+            variable=self.save_bad_files,
+        ).pack(anchor="w", padx=10, pady=4)
+
+        # ─── Блок времени и целостности ───
+        frame_time = ttk.LabelFrame(self, text="5. Время и целостность")
         frame_time.pack(fill="x", **pad)
 
         time_left = ttk.Frame(frame_time)
@@ -1491,6 +1464,10 @@ class App(tk.Tk):
         as_cards = self.view_mode.get() == "cards"
         config = ExtractConfig()
 
+        # Читаем настройки из UI — на момент запуска
+        keep_temp = not self.delete_temp_files.get()
+        save_bad = self.save_bad_files.get()
+
         out_path = filedialog.asksaveasfilename(
             title="Куда сохранить отчёты (будет создана папка)",
             defaultextension=f".{ext}",
@@ -1532,7 +1509,8 @@ class App(tk.Tk):
                 logger.log(f"  out: {out_path}")
                 logger.log(f"  fmt: {fmt}, view: {'cards' if as_cards else 'table'}")
                 logger.log(f"  work_dir: {work_dir}")
-                logger.log(f"  KEEP_TEMP_FILES: {KEEP_TEMP_FILES}")
+                logger.log(f"  keep_temp_files: {keep_temp}")
+                logger.log(f"  save_bad_files: {save_bad}")
                 logger.log("=" * 60)
 
                 clean_path = os.path.join(work_dir, "clean.xml")
@@ -1582,7 +1560,8 @@ class App(tk.Tk):
                     text=f"{total_in_xml:,}".replace(",", " "),
                     foreground="black"))
 
-                if not KEEP_TEMP_FILES:
+                # Удаляем очищенный файл, если не просили сохранять
+                if not keep_temp:
                     try:
                         os.remove(clean_path)
                     except Exception:
@@ -1679,12 +1658,17 @@ class App(tk.Tk):
                     except ET.XMLSyntaxError as xml_exc:
                         diag = diagnose_xml_error(month_path, xml_exc,
                                                   logger)
-                        saved_path = os.path.join(
-                            reports_dir,
-                            f"__ERROR___{ym}.xml")
-                        try:
-                            shutil.copy2(month_path, saved_path)
-                        except Exception:
+
+                        # Сохраняем битый файл только если опция включена
+                        if save_bad:
+                            saved_path = os.path.join(
+                                reports_dir,
+                                f"__ERROR___{ym}.xml")
+                            try:
+                                shutil.copy2(month_path, saved_path)
+                            except Exception:
+                                saved_path = month_path
+                        else:
                             saved_path = month_path
 
                         msg = (f"Ошибка XML в месяце {month_label} "
@@ -1752,6 +1736,8 @@ class App(tk.Tk):
                 msg_lines.append(f"Месяцев: {len(written)}")
                 msg_lines.append(f"Папка: {reports_dir}")
                 msg_lines.append(f"Лог: {log_path}")
+                if keep_temp:
+                    msg_lines.append(f"Временные файлы: {work_dir}")
                 msg_lines.append("")
                 for p, c in written[:15]:
                     msg_lines.append(
@@ -1790,7 +1776,7 @@ class App(tk.Tk):
                     logger.close()
 
                 if work_dir and os.path.exists(work_dir):
-                    if KEEP_TEMP_FILES:
+                    if keep_temp:
                         print(f"[DEBUG] Временные файлы в: {work_dir}")
                     else:
                         try:
