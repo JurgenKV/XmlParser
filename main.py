@@ -545,6 +545,69 @@ def split_xml_by_month(clean_src_path, split_dir,
 
 
 # ============================================================
+# 0.5. ТОЧНЫЙ ПОДСЧЁТ <Trans> ЧЕРЕЗ LXML
+# ============================================================
+#
+# Байтовый регэксп в split_xml_by_month (rb'<Trans(?=[\s>])')
+# может находить ложные срабатывания: например, подстроку
+# "<Trans " внутри комментария <!-- ... -->, внутри CDATA
+# или внутри текстового узла (Data/Reply/PureData).
+#
+# В результате счётчик split_xml_by_month даёт число больше,
+# чем реальное число элементов <Trans>, и проверка
+# целостности показывает ложное расхождение (обычно -1).
+#
+# lxml видит только настоящие XML-элементы, поэтому пересчёт
+# через XMLPullParser даёт "источник истины".
+
+def count_records_lxml(path, namespace=None, cancel_flag=None,
+                       progress_cb=None):
+    """Считает реальные <Trans> через lxml XMLPullParser.
+
+    Не извлекает поля, только считает элементы — быстро даже
+    на больших файлах, потому что не строит словарей на запись.
+    """
+    search_tag = qname(RECORD_TAG, namespace) if namespace else RECORD_TAG
+
+    parser = ET.XMLPullParser(
+        events=("end",),
+        tag=search_tag,
+        huge_tree=True,
+        recover=True,
+        resolve_entities=False,
+        no_network=True,
+    )
+
+    n = 0
+    CHUNK = 4 * 1024 * 1024
+
+    with open(path, "rb") as f:
+        while True:
+            if cancel_flag and cancel_flag.is_set():
+                break
+            chunk = f.read(CHUNK)
+            if not chunk:
+                break
+            try:
+                parser.feed(chunk)
+            except Exception:
+                pass
+            for _ in parser.read_events():
+                n += 1
+                if progress_cb and n % 50000 == 0:
+                    progress_cb(n)
+            if cancel_flag and cancel_flag.is_set():
+                break
+
+    try:
+        parser.close()
+    except Exception:
+        pass
+
+    return n
+
+
+# ============================================================
 # 1. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ============================================================
 
@@ -1527,6 +1590,11 @@ class App(tk.Tk):
                 f"Резка по месяцам: {pct}% ({mb} / {total_mb} МБ)",
                 "blue")
 
+    def _recount_progress_cb(self, ym, label, done_months, total_months):
+        self._set_status(
+            f"Пересчёт записей (lxml): {done_months}/{total_months} — "
+            f"{label}", "blue")
+
     def _reset_integrity_labels(self):
         self.lbl_total_xml.config(text="—", foreground="black")
         self.lbl_total_reports.config(text="—", foreground="black")
@@ -1596,7 +1664,7 @@ class App(tk.Tk):
                 os.makedirs(split_dir, exist_ok=True)
 
                 # ─── ЭТАП 1: очистка XML ───
-                self._set_status("Этап 1/3: очистка XML…", "blue")
+                self._set_status("Этап 1/4: очистка XML…", "blue")
                 logger.log("ЭТАП 1: очистка XML")
                 clean_xml_file(
                     xml_file, clean_path,
@@ -1609,7 +1677,7 @@ class App(tk.Tk):
 
                 # ─── ЭТАП 2: резка по месяцам ───
                 self._set_status(
-                    "Этап 2/3: резка XML по месяцам…", "blue")
+                    "Этап 2/4: резка XML по месяцам…", "blue")
                 logger.log("ЭТАП 2: резка по месяцам")
 
                 months_info = split_xml_by_month(
@@ -1625,18 +1693,11 @@ class App(tk.Tk):
                     raise RuntimeError(
                         "В файле не найдено ни одной транзакции.")
 
-                total_in_xml = sum(info["count"]
-                                   for info in months_info.values())
-                logger.log(f"Всего записей в XML: {total_in_xml}")
-                for ym in sorted(months_info.keys()):
-                    info = months_info[ym]
-                    logger.log(f"  {ym} ({info['label']}): "
-                               f"{info['count']} records, "
-                               f"file={info['path']}")
-
-                self.after(0, lambda: self.lbl_total_xml.config(
-                    text=f"{total_in_xml:,}".replace(",", " "),
-                    foreground="black"))
+                # Промежуточный итог от байтового регэкспа (может
+                # содержать ложные срабатывания — см. 0.5)
+                byte_total = sum(info["count"]
+                                 for info in months_info.values())
+                logger.log(f"Быстрый счёт (по байтам): {byte_total}")
 
                 if not keep_temp:
                     try:
@@ -1650,6 +1711,66 @@ class App(tk.Tk):
                 logger.log(f"namespace: {namespace}")
                 logger.log(f"header: {header}")
 
+                # ─── ЭТАП 2.5: точный пересчёт записей через lxml ───
+                # Байтовый регэксп rb'<Trans(?=[\s>])' может давать
+                # ложные срабатывания (например, "<Trans " внутри
+                # комментария или внутри текстового узла Data).
+                # lxml видит только настоящие XML-элементы — это
+                # источник истины.
+                self._set_status(
+                    "Этап 2.5/4: пересчёт записей (lxml)…", "blue")
+                logger.log("ЭТАП 2.5: пересчёт записей через lxml")
+
+                months_sorted_tmp = sorted(months_info.keys())
+                total_in_xml = 0
+                total_m_diff = 0
+
+                for idx, ym in enumerate(months_sorted_tmp, 1):
+                    if self.cancel_flag.is_set():
+                        raise RuntimeError("Отменено")
+
+                    info = months_info[ym]
+                    real_n = count_records_lxml(
+                        info["path"], namespace,
+                        cancel_flag=self.cancel_flag)
+
+                    if real_n != info["count"]:
+                        diff = info["count"] - real_n
+                        total_m_diff += abs(diff)
+                        logger.log(
+                            f"  WARN {ym} ({info['label']}): "
+                            f"byte_count={info['count']} "
+                            f"lxml_count={real_n} "
+                            f"diff={diff:+d}  "
+                            f"(ложные срабатывания байтового "
+                            f"регэкспа)")
+                    else:
+                        logger.log(f"  {ym} ({info['label']}): "
+                                   f"{real_n} records")
+
+                    info["count"] = real_n
+                    total_in_xml += real_n
+
+                    self._recount_progress_cb(
+                        ym, info["label"], idx, len(months_sorted_tmp))
+
+                logger.log(f"Точный счёт (lxml): {total_in_xml}")
+                if total_m_diff:
+                    logger.log(
+                        f"Суммарное расхождение байт/lxml: "
+                        f"{total_m_diff} (ложные срабатывания)")
+
+                for ym in sorted(months_info.keys()):
+                    info = months_info[ym]
+                    logger.log(f"  {ym} ({info['label']}): "
+                               f"{info['count']} records, "
+                               f"file={info['path']}")
+
+                self.after(0, lambda: self.lbl_total_xml.config(
+                    text=f"{total_in_xml:,}".replace(",", " "),
+                    foreground="black"))
+
+                # ─── Сэмпл колонок ───
                 sample_seen = {}
                 sample_desc = {}
                 for i, rec in enumerate(extract_records(
@@ -1697,7 +1818,7 @@ class App(tk.Tk):
                                f"({info['count']} records)")
 
                     self._set_status(
-                        f"Этап 3/3: {i}/{K} — {month_label} "
+                        f"Этап 3/4: {i}/{K} — {month_label} "
                         f"({info['count']} записей)…", "blue")
 
                     records_iter = extract_records(
@@ -1791,7 +1912,7 @@ class App(tk.Tk):
 
                 self.after(0, apply_end)
 
-                logger.log(f"total_in_xml: {total_in_xml}")
+                logger.log(f"total_in_xml (lxml): {total_in_xml}")
                 logger.log(f"total_in_reports: {total_in_reports}")
                 logger.log(f"total_time: {fmt_duration(total_time)}")
 
@@ -1808,6 +1929,11 @@ class App(tk.Tk):
                     msg_lines.append(
                         f"Целостность: РАСХОЖДЕНИЕ "
                         f"({total_in_xml - total_in_reports:+d})")
+                if total_m_diff:
+                    msg_lines.append(
+                        f"(байтовый счётчик дал лишних "
+                        f"{total_m_diff} — ложные срабатывания, "
+                        f"см. лог)")
                 msg_lines.append("")
                 msg_lines.append(f"Месяцев: {len(written)}")
                 msg_lines.append(f"Папка: {reports_dir}")
