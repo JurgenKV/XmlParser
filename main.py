@@ -13,6 +13,9 @@ from tkinter import ttk, filedialog, messagebox
 
 from lxml import etree as ET
 
+from reportlab import rl_config
+rl_config.pageCompression = 1   # сжимать страницы в PDF — меньше RAM при save()
+
 from reportlab.lib.pagesizes import A4, landscape, A3, A2, A1, A0
 from reportlab.lib.units import cm
 from reportlab.pdfgen import canvas as rl_canvas
@@ -41,7 +44,10 @@ EMPTY_MARK = "-"
 RECORD_NUM_COL = "__record_num__"
 TRADE_DATE_ATTR = "@TradeDate"
 
-CLEAN_CHUNK = 4 * 1024 * 1024
+# 1 МБ вместо 4 МБ: при 3-поточной чистке пик памяти
+# (raw_q + clean_q + текущий chunk + pending) падает с ~48 МБ до ~12 МБ.
+# На скорость почти не влияет: 1 МБ всё равно >> буфера ОС.
+CLEAN_CHUNK = 1 * 1024 * 1024
 QUEUE_DEPTH = 4
 
 FAST_LEN_THRESHOLD = 20
@@ -92,7 +98,11 @@ class Logger:
     def __init__(self, path):
         self.path = path
         self._lock = threading.Lock()
-        self._f = open(path, "w", encoding="utf-8", buffering=1)
+        # 64 КБ буфер вместо построчного (buffering=1):
+        # меньше syscall'ов, при kрэше всё равно сбрасывается
+        # через Logger.close() в finally.
+        self._f = open(path, "w", encoding="utf-8",
+                       buffering=64 * 1024)
 
     def log(self, msg):
         ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
@@ -103,7 +113,7 @@ class Logger:
             except Exception:
                 pass
             try:
-                print(line, flush=True)
+                print(line)
             except Exception:
                 pass
 
@@ -242,6 +252,9 @@ def _sanitize_tag(tag_bytes):
 
 
 def _process_clean_data(raw, final):
+    # Возвращаем bytearray напрямую: fo.write() принимает
+    # bytes-like объекты. Раньше был bytes(out) — лишняя копия
+    # всего 4-МБ чанка на каждый вызов.
     out = bytearray()
     pos = 0
     n = len(raw)
@@ -254,7 +267,7 @@ def _process_clean_data(raw, final):
             if _INVALID_BYTE_RE.search(tail):
                 tail = _INVALID_BYTE_RE.sub(b'', tail)
             out.extend(tail)
-            return bytes(out), b""
+            return out, b""
 
         text_chunk = raw[pos:lt]
         text_chunk = _fix_smart_quotes(text_chunk)
@@ -265,7 +278,7 @@ def _process_clean_data(raw, final):
         if raw[lt:lt + 4] == b'<!--':
             end = raw.find(b'-->', lt)
             if end == -1:
-                return bytes(out), raw[lt:]
+                return out, raw[lt:]
             out.extend(raw[lt:end + 3])
             pos = end + 3
             continue
@@ -273,7 +286,7 @@ def _process_clean_data(raw, final):
         if raw[lt:lt + 9] == b'<![CDATA[':
             end = raw.find(b']]>', lt)
             if end == -1:
-                return bytes(out), raw[lt:]
+                return out, raw[lt:]
             out.extend(raw[lt:end + 3])
             pos = end + 3
             continue
@@ -284,8 +297,8 @@ def _process_clean_data(raw, final):
                 tag = raw[lt:]
                 tag = _sanitize_tag(tag)
                 out.extend(tag)
-                return bytes(out), b""
-            return bytes(out), raw[lt:]
+                return out, b""
+            return out, raw[lt:]
 
         tag = raw[lt:gt + 1]
 
@@ -300,7 +313,7 @@ def _process_clean_data(raw, final):
         out.extend(tag)
         pos = gt + 1
 
-    return bytes(out), b""
+    return out, b""
 
 
 def _reader_thread(fi, raw_q, cancel_flag, clean_progress_cb, total_size):
@@ -350,6 +363,7 @@ def _writer_thread(fo, clean_q, cancel_flag):
                 break
             if cancel_flag and cancel_flag.is_set():
                 break
+            # chunk может быть bytearray — это нормально
             fo.write(chunk)
     finally:
         fo.flush()
@@ -487,7 +501,8 @@ def split_xml_by_month(clean_src_path, split_dir,
                 if not date_parsed:
                     gt = data.find(b'>', pos)
                     if gt != -1:
-                        tag_bytes = bytes(buf) + data[pos:gt + 1]
+                        # buf и data[..] — bytes-like; regex работает и с bytearray
+                        tag_bytes = buf + data[pos:gt + 1]
                         m2 = _TRADE_DATE_RE.search(tag_bytes)
                         if m2:
                             d = m2.group(1).decode("ascii",
@@ -513,7 +528,8 @@ def split_xml_by_month(clean_src_path, split_dir,
                         "0000-00", "0000_БезДаты")
 
                 entry = get_writer(current_ym, current_label)
-                entry["fd"].write(bytes(buf))
+                # write() принимает bytearray — без bytes(buf)
+                entry["fd"].write(buf)
                 entry["fd"].write(b"\n")
                 entry["count"] += 1
 
@@ -727,6 +743,44 @@ def format_date_string(s):
 # 1.1. ДИАГНОСТИКА XML-ФАЙЛА
 # ============================================================
 
+def _read_selected_lines(path, target_lines, before=3, after=3):
+    """Читает из файла только нужные строки (и их контекст).
+
+    target_lines: iterable номеров строк (1-based).
+    Возвращает dict {lineno: bytes} (без завершающего \\n,
+    как при data.split(b"\\n")).
+
+    Память — O(число нужных строк), а не O(размер файла).
+    На 16-ГБ файле это критично: раньше diagnose_xml_error
+    делал data = f.read() и мгновенно съедал всю RAM.
+    """
+    needed = set()
+    for t in target_lines:
+        if not t:
+            continue
+        for i in range(max(1, t - before), t + after + 1):
+            needed.add(i)
+    if not needed:
+        return {}
+
+    lo = min(needed)
+    hi = max(needed)
+    result = {}
+
+    with open(path, "rb") as f:
+        for lineno, raw in enumerate(f, 1):
+            if lineno < lo:
+                continue
+            if lineno > hi:
+                break
+            if lineno in needed:
+                if raw.endswith(b"\n"):
+                    raw = raw[:-1]
+                result[lineno] = raw
+
+    return result
+
+
 def diagnose_xml_error(xml_path, error, logger):
     lines_report = []
     lines_report.append(f"Файл: {xml_path}")
@@ -742,14 +796,14 @@ def diagnose_xml_error(xml_path, error, logger):
                 "message": str(error),
             })()]
 
+    # Читаем только окрестности строк с ошибками, не весь файл
+    target_lines = [e.line for e in entries[:5] if e.line]
     try:
-        with open(xml_path, "rb") as f:
-            data = f.read()
+        line_data = _read_selected_lines(xml_path, target_lines,
+                                         before=3, after=3)
     except Exception as exc:
         lines_report.append(f"Не удалось прочитать файл: {exc}")
         return "\n".join(lines_report)
-
-    all_lines = data.split(b"\n")
 
     for e in entries[:5]:
         ln = e.line
@@ -759,50 +813,52 @@ def diagnose_xml_error(xml_path, error, logger):
         lines_report.append(f"--- Ошибка на строке {ln}, "
                             f"колонке {col}: {msg} ---")
 
-        if 1 <= ln <= len(all_lines):
-            raw = all_lines[ln - 1]
-            try:
-                txt = raw.decode("cp1251", errors="replace")
-            except Exception:
-                txt = raw.decode("utf-8", errors="replace")
-
-            col0 = max(0, (col or 1) - 1)
-            left = max(0, col0 - 40)
-            right = min(len(txt), col0 + 40)
-
-            lines_report.append(f"  строка (срез {left}..{right}):")
-            lines_report.append(f"    ...{txt[left:right]}...")
-            lines_report.append(f"  байты вокруг (hex):")
-            try:
-                hex_slice = raw[max(0, col0 - 20): col0 + 20]
-                lines_report.append(f"    {hex_slice.hex(' ')}")
-            except Exception:
-                pass
-
-            caret_pos = col0 - left
-            lines_report.append(f"    {' ' * caret_pos}^")
-
-            if len(txt) > 500:
-                lines_report.append(f"  полная строка (первые 500):")
-                lines_report.append(f"    {txt[:500]}")
-            else:
-                lines_report.append(f"  полная строка:")
-                lines_report.append(f"    {txt}")
-
-            lines_report.append(f"  контекст:")
-            for i in range(max(1, ln - 3),
-                           min(len(all_lines), ln + 3) + 1):
-                raw_i = all_lines[i - 1]
-                try:
-                    t_i = raw_i.decode("cp1251", errors="replace")
-                except Exception:
-                    t_i = raw_i.decode("utf-8", errors="replace")
-                if len(t_i) > 200:
-                    t_i = t_i[:200] + "..."
-                marker = ">>>" if i == ln else "   "
-                lines_report.append(f"    {marker} {i:>6}: {t_i}")
-        else:
+        raw = line_data.get(ln)
+        if raw is None:
             lines_report.append("  (не удалось найти эту строку)")
+            continue
+
+        try:
+            txt = raw.decode("cp1251", errors="replace")
+        except Exception:
+            txt = raw.decode("utf-8", errors="replace")
+
+        col0 = max(0, (col or 1) - 1)
+        left = max(0, col0 - 40)
+        right = min(len(txt), col0 + 40)
+
+        lines_report.append(f"  строка (срез {left}..{right}):")
+        lines_report.append(f"    ...{txt[left:right]}...")
+        lines_report.append(f"  байты вокруг (hex):")
+        try:
+            hex_slice = raw[max(0, col0 - 20): col0 + 20]
+            lines_report.append(f"    {hex_slice.hex(' ')}")
+        except Exception:
+            pass
+
+        caret_pos = col0 - left
+        lines_report.append(f"    {' ' * caret_pos}^")
+
+        if len(txt) > 500:
+            lines_report.append(f"  полная строка (первые 500):")
+            lines_report.append(f"    {txt[:500]}")
+        else:
+            lines_report.append(f"  полная строка:")
+            lines_report.append(f"    {txt}")
+
+        lines_report.append(f"  контекст:")
+        for i in range(max(1, ln - 3), ln + 4):
+            raw_i = line_data.get(i)
+            if raw_i is None:
+                continue
+            try:
+                t_i = raw_i.decode("cp1251", errors="replace")
+            except Exception:
+                t_i = raw_i.decode("utf-8", errors="replace")
+            if len(t_i) > 200:
+                t_i = t_i[:200] + "..."
+            marker = ">>>" if i == ln else "   "
+            lines_report.append(f"    {marker} {i:>6}: {t_i}")
 
     text = "\n".join(lines_report)
 
