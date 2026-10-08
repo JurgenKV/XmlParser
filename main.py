@@ -180,14 +180,15 @@ _INVALID_BYTE_RE = re.compile(
     rb'[' + re.escape(_INVALID_XML_BYTES) + rb']'
 )
 
-# ─── Умные кавычки и тире cp1251 — ПРОСТО УДАЛЯЕМ ───
+# ─── Умные кавычки/тире cp1251 -> ASCII-эквиваленты ───
+# 0x91 ‘  0x92 ’  0x93 “  0x94 ”  0x96 –  0x97 —
 _SMART_CHARS_MAP = {
-    0x91: b"",
-    0x92: b"",
-    0x93: b"",
-    0x94: b"",
-    0x96: b"",
-    0x97: b"",
+    0x91: b"'",
+    0x92: b"'",
+    0x93: b'"',
+    0x94: b'"',
+    0x96: b'-',
+    0x97: b'-',
 }
 _SMART_CHARS_RE = re.compile(
     b'[' + bytes(_SMART_CHARS_MAP.keys()) + b']'
@@ -208,7 +209,7 @@ def _fix_smart_quotes(data: bytes) -> bytes:
 
 
 def _sanitize_tag(tag_bytes):
-    # 0) умные кавычки/тире — просто удаляем
+    # 0) умные кавычки/тире -> ASCII " / ' / -
     tag_bytes = _fix_smart_quotes(tag_bytes)
 
     # 1) невалидные управляющие байты — удаляем
