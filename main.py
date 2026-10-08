@@ -177,13 +177,6 @@ _INVALID_BYTE_RE = re.compile(
     rb'[' + re.escape(_INVALID_XML_BYTES) + rb']'
 )
 
-# ─── Умные кавычки и тире cp1251 ───
-# 0x91 ‘  -> '
-# 0x92 ’  -> '
-# 0x93 “  -> "
-# 0x94 ”  -> "
-# 0x96 –  -> -
-# 0x97 —  -> -
 _SMART_CHARS_MAP = {
     0x91: b"'",
     0x92: b"'",
@@ -211,18 +204,14 @@ def _fix_smart_quotes(data: bytes) -> bytes:
 
 
 def _sanitize_tag(tag_bytes):
-    # 0) умные кавычки/тире -> ASCII
     tag_bytes = _fix_smart_quotes(tag_bytes)
 
-    # 1) невалидные управляющие байты
     if _INVALID_BYTE_RE.search(tag_bytes):
         tag_bytes = _INVALID_BYTE_RE.sub(b'', tag_bytes)
 
-    # 2) & -> &amp;
     if b'&' in tag_bytes:
         tag_bytes = _AMP_FIX.sub(b'&amp;', tag_bytes)
 
-    # 3) =""X"" -> ="&quot;X&quot;"
     if b'=""' in tag_bytes:
         tag_bytes = _BROKEN_QUOTE.sub(
             rb'="&quot;\1&quot;"', tag_bytes)
@@ -762,7 +751,7 @@ class ExtractConfig:
 
 
 # ============================================================
-# 3. ИЗВЛЕЧЕНИЕ ЗАПИСЕЙ
+# 3. ИЗВЛЕЧЕНИЕ ЗАПИСЕЙ — через XMLPullParser (huge_tree=True)
 # ============================================================
 
 def extract_records(path, record_tag=RECORD_TAG, namespace=None,
@@ -775,105 +764,127 @@ def extract_records(path, record_tag=RECORD_TAG, namespace=None,
 
     search_tag = qname(record_tag, namespace)
 
-    with open(path, "rb") as f:
-        # huge_tree=True обязателен для больших QUIK-отчётов.
-        # Без него libxml2 падает с "internal error: Huge input lookup",
-        # когда размер накопленного дерева превышает встроенные лимиты.
-        parser = ET.XMLParser(
-            huge_tree=True,
-            recover=True,
-            resolve_entities=False,
-            no_network=True,
-        )
-        context = ET.iterparse(
-            f,
-            events=("end",),
-            tag=search_tag,
-            parser=parser,
-        )
+    # XMLPullParser принимает huge_tree=True и работает потоково.
+    # Это ЕДИНСТВЕННЫЙ надёжный способ обойти "Huge input lookup"
+    # в lxml 6.x — iterparse(parser=...) не поддерживается,
+    # а iterparse(huge_tree=True) не всегда помогает.
+    parser = ET.XMLPullParser(
+        events=("end",),
+        tag=search_tag,
+        huge_tree=True,
+        recover=True,
+        resolve_entities=False,
+        no_network=True,
+    )
 
-        count = 0
-        for _, elem in context:
+    count = 0
+    CHUNK = 4 * 1024 * 1024
+
+    with open(path, "rb") as f:
+        while True:
             if cancel_flag and cancel_flag.is_set():
                 return
 
-            rec = {}
+            data = f.read(CHUNK)
+            if not data:
+                break
 
-            for k, v in elem.attrib.items():
-                rec[f"@{strip_ns(k)}"] = v
+            try:
+                parser.feed(data)
+            except Exception:
+                # recover=True должен проглатывать битые куски,
+                # но на всякий случай не даём упасть
+                pass
 
-            for child in elem:
-                if not isinstance(child.tag, str):
-                    continue
-                tag_local = strip_ns(child.tag)
+            for _, elem in parser.read_events():
+                if cancel_flag and cancel_flag.is_set():
+                    return
 
-                if tag_local == config.container_tag:
-                    fields = list(child.findall(config.field_tag))
-                    if namespace and not fields:
-                        fields = list(child.findall(
-                            f"{{{namespace}}}{config.field_tag}"))
+                rec = {}
 
-                    def _num_key(fe):
-                        try:
-                            return int(fe.get("Number") or 0)
-                        except ValueError:
-                            return 0
-                    fields.sort(key=_num_key)
+                # Атрибуты самой <Trans>
+                for k, v in elem.attrib.items():
+                    rec[f"@{strip_ns(k)}"] = v
 
-                    for field in fields:
-                        name = (field.get(config.name_attr) or "").strip()
-                        desc = (field.get(config.description_attr) or "").strip()
-                        prepared = (field.get(config.prepared_attr) or "").strip()
+                # Дочерние узлы <Trans>
+                for child in elem:
+                    if not isinstance(child.tag, str):
+                        continue
+                    tag_local = strip_ns(child.tag)
 
-                        if not name:
-                            continue
+                    if tag_local == config.container_tag:
+                        fields = list(child.findall(config.field_tag))
+                        if namespace and not fields:
+                            fields = list(child.findall(
+                                f"{{{namespace}}}{config.field_tag}"))
 
-                        if desc and name not in descriptions:
-                            descriptions[name] = desc
+                        def _num_key(fe):
+                            try:
+                                return int(fe.get("Number") or 0)
+                            except ValueError:
+                                return 0
+                        fields.sort(key=_num_key)
 
-                        display = prepared
+                        for field in fields:
+                            name = (field.get(config.name_attr) or "").strip()
+                            desc = (field.get(config.description_attr) or "").strip()
+                            prepared = (field.get(config.prepared_attr) or "").strip()
 
-                        if name in rec:
+                            if not name:
+                                continue
+
+                            if desc and name not in descriptions:
+                                descriptions[name] = desc
+
+                            display = prepared
+
+                            if name in rec:
+                                i = 2
+                                while f"{name}_{i}" in rec:
+                                    i += 1
+                                rec[f"{name}_{i}"] = display
+                            else:
+                                rec[name] = display
+                        continue
+
+                    text = (child.text or "").strip()
+                    if text:
+                        key = tag_local
+                        if key in rec:
                             i = 2
-                            while f"{name}_{i}" in rec:
+                            while f"{key}_{i}" in rec:
                                 i += 1
-                            rec[f"{name}_{i}"] = display
+                            rec[f"{key}_{i}"] = text
                         else:
-                            rec[name] = display
-                    continue
+                            rec[key] = text
 
-                text = (child.text or "").strip()
-                if text:
-                    key = tag_local
-                    if key in rec:
-                        i = 2
-                        while f"{key}_{i}" in rec:
-                            i += 1
-                        rec[f"{key}_{i}"] = text
-                    else:
-                        rec[key] = text
+                    for ak, av in child.attrib.items():
+                        key = f"{tag_local}.@{strip_ns(ak)}"
+                        if key in rec:
+                            i = 2
+                            while f"{key}_{i}" in rec:
+                                i += 1
+                            rec[f"{key}_{i}"] = av
+                        else:
+                            rec[key] = av
 
-                for ak, av in child.attrib.items():
-                    key = f"{tag_local}.@{strip_ns(ak)}"
-                    if key in rec:
-                        i = 2
-                        while f"{key}_{i}" in rec:
-                            i += 1
-                        rec[f"{key}_{i}"] = av
-                    else:
-                        rec[key] = av
+                yield rec
 
-            yield rec
+                # Освобождение памяти
+                elem.clear()
+                while elem.getprevious() is not None:
+                    del elem.getparent()[0]
 
-            elem.clear()
-            while elem.getprevious() is not None:
-                del elem.getparent()[0]
+                count += 1
+                if progress_cb and count % 1000 == 0:
+                    progress_cb(count)
+                if max_records and count >= max_records:
+                    return
 
-            count += 1
-            if progress_cb and count % 1000 == 0:
-                progress_cb(count)
-            if max_records and count >= max_records:
-                return
+        try:
+            parser.close()
+        except Exception:
+            pass
 
 
 # ============================================================
@@ -1340,7 +1351,6 @@ class App(tk.Tk):
         self.format_var = tk.StringVar(value="html")
         self.view_mode = tk.StringVar(value="cards")
 
-        # Чекбоксы
         self.delete_temp_files = tk.BooleanVar(value=True)
         self.save_bad_files = tk.BooleanVar(value=True)
 
