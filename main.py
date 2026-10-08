@@ -286,7 +286,6 @@ def clean_xml_file(src_path, dst_path, progress_cb=None, cancel_flag=None):
 # 0.3. РАЗБИВКА XML ПО МЕСЯЦАМ — ОДИН ПРОХОД
 # ============================================================
 
-# <Trans + пробел/таб/перевод/'>'  — но не <TransData, не <TransactionsReport
 _TRANS_START_RE = re.compile(rb'<Trans(?=[\s>])')
 _TRADE_DATE_RE = re.compile(rb'\bTradeDate\s*=\s*"([^"]*)"')
 
@@ -296,13 +295,11 @@ def split_xml_by_month(clean_src_path, split_dir,
     """
     Читает clean_src_path (уже очищенный) и режет его на файлы
     по месяцам — по границам </Trans>.
-    В split_dir кладёт файлы <ym>.xml (например, 2019-01.xml).
 
     Возвращает dict: {ym: {'label': ..., 'path': ..., 'count': N}}
     """
     os.makedirs(split_dir, exist_ok=True)
 
-    # ---- 1. Найти преамбулу (всё до <TransactionsReport ...>) ----
     with open(clean_src_path, "rb") as f:
         head = f.read(16384)
 
@@ -315,7 +312,6 @@ def split_xml_by_month(clean_src_path, split_dir,
     preamble = head[:root_open_end]
     closing_tag = b'\n</TransactionsReport>\n'
 
-    # ---- 2. Буферы записи для каждого месяца ----
     open_files = {}
 
     def get_writer(ym, label):
@@ -330,15 +326,14 @@ def split_xml_by_month(clean_src_path, split_dir,
             open_files[ym] = entry
         return entry
 
-    # ---- 3. Идём по файлу, отслеживая <Trans>...</Trans> ----
     total_read = 0
     file_size = os.path.getsize(clean_src_path)
 
-    buf = bytearray()          # накопленный текст незавершённой записи
+    buf = bytearray()
     in_trans = False
     current_ym = None
     current_label = None
-    date_parsed = False        # уже разобрали TradeDate для текущей записи?
+    date_parsed = False
 
     with open(clean_src_path, "rb") as f:
         f.seek(root_open_end)
@@ -360,7 +355,6 @@ def split_xml_by_month(clean_src_path, split_dir,
 
             while pos < len(data):
                 if not in_trans:
-                    # Ищем начало <Trans
                     m = _TRANS_START_RE.search(data, pos)
                     if not m:
                         pos = len(data)
@@ -372,14 +366,10 @@ def split_xml_by_month(clean_src_path, split_dir,
                     current_label = None
                     buf = bytearray()
                     pos = m.start()
-                    # не продолжаем здесь — упадём в блок "мы внутри Trans"
 
-                # Мы внутри <Trans> — накапливаем байты до </Trans>.
-                # Отдельно ищем первый '>' для разбора TradeDate.
                 if not date_parsed:
                     gt = data.find(b'>', pos)
                     if gt != -1:
-                        # Разбираем TradeDate в открывающем теге
                         tag_bytes = bytes(buf) + data[pos:gt + 1]
                         m2 = _TRADE_DATE_RE.search(tag_bytes)
                         if m2:
@@ -392,14 +382,12 @@ def split_xml_by_month(clean_src_path, split_dir,
                                 "0000-00", "0000_БезДаты")
                         date_parsed = True
 
-                # Ищем </Trans>
                 end = data.find(b'</Trans>', pos)
                 if end == -1:
                     buf.extend(data[pos:])
                     pos = len(data)
                     break
 
-                # Нашли </Trans>
                 end_pos = end + len(b'</Trans>')
                 buf.extend(data[pos:end_pos])
 
@@ -412,7 +400,6 @@ def split_xml_by_month(clean_src_path, split_dir,
                 entry["fd"].write(b"\n")
                 entry["count"] += 1
 
-                # Сброс
                 buf = bytearray()
                 in_trans = False
                 date_parsed = False
@@ -420,7 +407,6 @@ def split_xml_by_month(clean_src_path, split_dir,
                 current_label = None
                 pos = end_pos
 
-    # ---- 4. Закрываем все файлы ----
     result = {}
     for ym, entry in open_files.items():
         entry["fd"].write(closing_tag)
@@ -1043,7 +1029,6 @@ def export_pdf_month(out_path, month_label, records_iter,
         c.save()
         return count
 
-    # ────── Таблица ──────
     page_y = draw_report_header(True)
     page_y = draw_table_header(page_y)
 
@@ -1106,7 +1091,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("QUIK XML → отчёты по месяцам (HTML / PDF)")
-        self.geometry("820x560")
+        self.geometry("860x640")
         self.resizable(False, False)
 
         self.xml_path = tk.StringVar()
@@ -1145,23 +1130,60 @@ class App(tk.Tk):
                             variable=self.format_var).pack(
                 side="left", padx=16, pady=8)
 
-        frame_time = ttk.LabelFrame(self, text="Время")
+        # ─── Блок времени и целостности ───
+        frame_time = ttk.LabelFrame(self, text="Время и целостность")
         frame_time.pack(fill="x", **pad)
 
-        ttk.Label(frame_time, text="Начало:").grid(
-            row=0, column=0, sticky="w", padx=6, pady=3)
-        self.lbl_start = ttk.Label(frame_time, text="—")
-        self.lbl_start.grid(row=0, column=1, sticky="w", padx=6, pady=3)
+        # Левая колонка — время
+        time_left = ttk.Frame(frame_time)
+        time_left.grid(row=0, column=0, sticky="nw", padx=6, pady=3)
 
-        ttk.Label(frame_time, text="Конец:").grid(
-            row=1, column=0, sticky="w", padx=6, pady=3)
-        self.lbl_end = ttk.Label(frame_time, text="—")
-        self.lbl_end.grid(row=1, column=1, sticky="w", padx=6, pady=3)
+        ttk.Label(time_left, text="Начало:").grid(
+            row=0, column=0, sticky="w", padx=4, pady=2)
+        self.lbl_start = ttk.Label(time_left, text="—")
+        self.lbl_start.grid(row=0, column=1, sticky="w", padx=4, pady=2)
 
-        ttk.Label(frame_time, text="Прошло:").grid(
-            row=2, column=0, sticky="w", padx=6, pady=3)
-        self.lbl_elapsed = ttk.Label(frame_time, text="—")
-        self.lbl_elapsed.grid(row=2, column=1, sticky="w", padx=6, pady=3)
+        ttk.Label(time_left, text="Конец:").grid(
+            row=1, column=0, sticky="w", padx=4, pady=2)
+        self.lbl_end = ttk.Label(time_left, text="—")
+        self.lbl_end.grid(row=1, column=1, sticky="w", padx=4, pady=2)
+
+        ttk.Label(time_left, text="Прошло:").grid(
+            row=2, column=0, sticky="w", padx=4, pady=2)
+        self.lbl_elapsed = ttk.Label(time_left, text="—")
+        self.lbl_elapsed.grid(row=2, column=1, sticky="w", padx=4, pady=2)
+
+        # Разделитель
+        ttk.Separator(frame_time, orient="vertical").grid(
+            row=0, column=1, sticky="ns", padx=12, pady=4)
+
+        # Правая колонка — целостность
+        time_right = ttk.Frame(frame_time)
+        time_right.grid(row=0, column=2, sticky="nw", padx=6, pady=3)
+
+        ttk.Label(time_right, text="Всего записей в XML:").grid(
+            row=0, column=0, sticky="w", padx=4, pady=2)
+        self.lbl_total_xml = ttk.Label(
+            time_right, text="—",
+            font=("Segoe UI", 10, "bold"))
+        self.lbl_total_xml.grid(row=0, column=1, sticky="w",
+                                padx=4, pady=2)
+
+        ttk.Label(time_right, text="Записей в отчётах:").grid(
+            row=1, column=0, sticky="w", padx=4, pady=2)
+        self.lbl_total_reports = ttk.Label(
+            time_right, text="—",
+            font=("Segoe UI", 10, "bold"))
+        self.lbl_total_reports.grid(row=1, column=1, sticky="w",
+                                    padx=4, pady=2)
+
+        ttk.Label(time_right, text="Проверка:").grid(
+            row=2, column=0, sticky="w", padx=4, pady=2)
+        self.lbl_integrity = ttk.Label(
+            time_right, text="—",
+            font=("Segoe UI", 10, "bold"))
+        self.lbl_integrity.grid(row=2, column=1, sticky="w",
+                                padx=4, pady=2)
 
         frame_prog = ttk.LabelFrame(self, text="Прогресс")
         frame_prog.pack(fill="x", **pad)
@@ -1222,6 +1244,11 @@ class App(tk.Tk):
                 f"Резка по месяцам: {pct}% ({mb} / {total_mb} МБ)",
                 "blue")
 
+    def _reset_integrity_labels(self):
+        self.lbl_total_xml.config(text="—", foreground="black")
+        self.lbl_total_reports.config(text="—", foreground="black")
+        self.lbl_integrity.config(text="—", foreground="gray")
+
     def convert(self):
         xml_file = self.xml_path.get().strip()
         if not xml_file or not os.path.isfile(xml_file):
@@ -1249,6 +1276,7 @@ class App(tk.Tk):
         self.lbl_start.config(text=started_at.strftime('%d.%m.%Y %H:%M:%S'))
         self.lbl_end.config(text="—")
         self.lbl_elapsed.config(text="—")
+        self._reset_integrity_labels()
 
         self.cancel_flag.clear()
         self.btn_convert.config(state="disabled")
@@ -1259,8 +1287,6 @@ class App(tk.Tk):
         def worker():
             work_dir = None
             try:
-                # Рабочая папка — рядом с исходным файлом, чтобы не
-                # улететь на другой диск (там может не быть места)
                 src_dir = os.path.dirname(os.path.abspath(xml_file))
                 work_dir = tempfile.mkdtemp(
                     prefix="quik_work_", dir=src_dir)
@@ -1295,21 +1321,24 @@ class App(tk.Tk):
                     raise RuntimeError(
                         "В файле не найдено ни одной транзакции.")
 
-                # Очищенный файл больше не нужен — можно удалить
+                # Сумма записей по месяцам = сколько записей в исходном XML
+                total_in_xml = sum(info["count"]
+                                   for info in months_info.values())
+
+                self.after(0, lambda: self.lbl_total_xml.config(
+                    text=f"{total_in_xml:,}".replace(",", " "),
+                    foreground="black"))
+
                 if not KEEP_TEMP_FILES:
                     try:
                         os.remove(clean_path)
                     except Exception:
                         pass
 
-                # Читаем header и namespace уже из первого файла-месяца
-                # (там та же преамбула, что в исходном)
                 first_month_path = list(months_info.values())[0]["path"]
                 namespace = detect_namespace(first_month_path)
                 header = read_report_header(first_month_path)
 
-                # Определяем колонки по первому месяцу (пробный проход
-                # по первым 200 записям — быстро)
                 sample_seen = {}
                 sample_desc = {}
                 for i, rec in enumerate(extract_records(
@@ -1380,6 +1409,26 @@ class App(tk.Tk):
 
                     written.append((file_path, count))
 
+                # Сумма записей в отчётах
+                total_in_reports = sum(c for _, c in written)
+
+                def update_integrity():
+                    self.lbl_total_reports.config(
+                        text=f"{total_in_reports:,}".replace(",", " "),
+                        foreground="black")
+                    if total_in_reports == total_in_xml:
+                        self.lbl_integrity.config(
+                            text=f"OK — {total_in_xml:,}".replace(",", " "),
+                            foreground="green")
+                    else:
+                        diff = total_in_xml - total_in_reports
+                        self.lbl_integrity.config(
+                            text=f"РАСХОЖДЕНИЕ: {diff:+,}"
+                                 .replace(",", " "),
+                            foreground="red")
+
+                self.after(0, update_integrity)
+
                 self._end_time = time.time()
                 end_dt = datetime.now()
                 total_time = self._end_time - self._start_time
@@ -1394,14 +1443,20 @@ class App(tk.Tk):
                 if not written:
                     raise RuntimeError("Отчёты не сформированы (отменено)")
 
-                total_records = sum(c for _, c in written)
-
                 msg_lines = [
-                    f"Всего записей: {total_records}",
-                    f"Месяцев: {len(written)}",
-                    f"Папка: {reports_dir}",
-                    "",
+                    f"Всего записей в XML: {total_in_xml}",
+                    f"Записей в отчётах: {total_in_reports}",
                 ]
+                if total_in_reports == total_in_xml:
+                    msg_lines.append("Целостность: OK")
+                else:
+                    msg_lines.append(
+                        f"Целостность: РАСХОЖДЕНИЕ "
+                        f"({total_in_xml - total_in_reports:+d})")
+                msg_lines.append("")
+                msg_lines.append(f"Месяцев: {len(written)}")
+                msg_lines.append(f"Папка: {reports_dir}")
+                msg_lines.append("")
                 for p, c in written[:15]:
                     msg_lines.append(
                         f"  • {os.path.basename(p)} — {c}")
