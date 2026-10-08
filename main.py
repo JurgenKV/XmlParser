@@ -177,13 +177,18 @@ _INVALID_BYTE_RE = re.compile(
     rb'[' + re.escape(_INVALID_XML_BYTES) + rb']'
 )
 
+# ─── Умные кавычки и тире cp1251 — ПРОСТО УДАЛЯЕМ ───
+# 0x91 ‘  0x92 ’  0x93 “  0x94 ”  0x96 –  0x97 —
+# Эти символы ломают границы атрибутов в QUIK-отчётах
+# (парсер видит внутри значения обычную кавычку, хотя
+# это другой байт), поэтому безопаснее от них избавиться.
 _SMART_CHARS_MAP = {
-    0x91: b"'",
-    0x92: b"'",
-    0x93: b'"',
-    0x94: b'"',
-    0x96: b'-',
-    0x97: b'-',
+    0x91: b"",
+    0x92: b"",
+    0x93: b"",
+    0x94: b"",
+    0x96: b"",
+    0x97: b"",
 }
 _SMART_CHARS_RE = re.compile(
     b'[' + bytes(_SMART_CHARS_MAP.keys()) + b']'
@@ -192,7 +197,7 @@ _SMART_CHARS_RE = re.compile(
 
 def _smart_replace(match):
     b = match.group(0)[0]
-    return _SMART_CHARS_MAP.get(b, b' ')
+    return _SMART_CHARS_MAP.get(b, b'')
 
 
 def _fix_smart_quotes(data: bytes) -> bytes:
@@ -204,14 +209,18 @@ def _fix_smart_quotes(data: bytes) -> bytes:
 
 
 def _sanitize_tag(tag_bytes):
+    # 0) умные кавычки/тире — просто удаляем
     tag_bytes = _fix_smart_quotes(tag_bytes)
 
+    # 1) невалидные управляющие байты — удаляем
     if _INVALID_BYTE_RE.search(tag_bytes):
         tag_bytes = _INVALID_BYTE_RE.sub(b'', tag_bytes)
 
+    # 2) & -> &amp;
     if b'&' in tag_bytes:
         tag_bytes = _AMP_FIX.sub(b'&amp;', tag_bytes)
 
+    # 3) =""X"" -> ="&quot;X&quot;"
     if b'=""' in tag_bytes:
         tag_bytes = _BROKEN_QUOTE.sub(
             rb'="&quot;\1&quot;"', tag_bytes)
@@ -764,10 +773,6 @@ def extract_records(path, record_tag=RECORD_TAG, namespace=None,
 
     search_tag = qname(record_tag, namespace)
 
-    # XMLPullParser принимает huge_tree=True и работает потоково.
-    # Это ЕДИНСТВЕННЫЙ надёжный способ обойти "Huge input lookup"
-    # в lxml 6.x — iterparse(parser=...) не поддерживается,
-    # а iterparse(huge_tree=True) не всегда помогает.
     parser = ET.XMLPullParser(
         events=("end",),
         tag=search_tag,
@@ -792,8 +797,6 @@ def extract_records(path, record_tag=RECORD_TAG, namespace=None,
             try:
                 parser.feed(data)
             except Exception:
-                # recover=True должен проглатывать битые куски,
-                # но на всякий случай не даём упасть
                 pass
 
             for _, elem in parser.read_events():
@@ -802,11 +805,9 @@ def extract_records(path, record_tag=RECORD_TAG, namespace=None,
 
                 rec = {}
 
-                # Атрибуты самой <Trans>
                 for k, v in elem.attrib.items():
                     rec[f"@{strip_ns(k)}"] = v
 
-                # Дочерние узлы <Trans>
                 for child in elem:
                     if not isinstance(child.tag, str):
                         continue
@@ -870,7 +871,6 @@ def extract_records(path, record_tag=RECORD_TAG, namespace=None,
 
                 yield rec
 
-                # Освобождение памяти
                 elem.clear()
                 while elem.getprevious() is not None:
                     del elem.getparent()[0]
