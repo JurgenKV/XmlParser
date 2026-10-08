@@ -630,6 +630,12 @@ def count_records_lxml(path, namespace=None, cancel_flag=None,
 
     Не извлекает поля, только считает элементы — быстро даже
     на больших файлах, потому что не строит словарей на запись.
+
+    ВАЖНО: каждый end-event очищается сразу (elem.clear +
+    удаление prev-узлов). Без этого XMLPullParser накапливает
+    всё дерево документа в памяти — именно это давало пик RAM
+    на этапе «пересчёт записей (lxml)» на больших файлах.
+    Это ровно та же очистка, что делает extract_records.
     """
     search_tag = qname(RECORD_TAG, namespace) if namespace else RECORD_TAG
 
@@ -657,10 +663,19 @@ def count_records_lxml(path, namespace=None, cancel_flag=None,
                     parser.feed(chunk)
                 except Exception:
                     pass
-                for _ in parser.read_events():
+
+                # Ключевой момент: забираем элемент и СРАЗУ его
+                # очищаем. Без этого дерево копится до конца файла.
+                for _, elem in parser.read_events():
                     n += 1
+                    if elem is not None:
+                        elem.clear()
+                        while elem.getprevious() is not None:
+                            del elem.getparent()[0]
+
                     if progress_cb and n % 50000 == 0:
                         progress_cb(n)
+
                 if cancel_flag and cancel_flag.is_set():
                     break
 
@@ -1847,6 +1862,7 @@ class App(tk.Tk):
                         raise RuntimeError("Отменено")
 
                     info = months_info[ym]
+                    rss_before = rss_mb()
                     real_n = count_records_lxml(
                         info["path"], namespace,
                         cancel_flag=self.cancel_flag)
@@ -1864,6 +1880,14 @@ class App(tk.Tk):
                     else:
                         logger.log(f"  {ym} ({info['label']}): "
                                    f"{real_n} records")
+
+                    # Пересчёт мог накопить мусор в lxml-структурах.
+                    gc.collect()
+                    rss_after = rss_mb()
+                    logger.log(
+                        f"  RSS после пересчёта {ym}: "
+                        f"{rss_after:.0f} МБ "
+                        f"(Δ {rss_after - rss_before:+.0f})")
 
                     info["count"] = real_n
                     total_in_xml += real_n
