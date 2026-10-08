@@ -140,7 +140,8 @@ def extract_month_key(rec):
 # ============================================================
 
 _AMP_FIX = re.compile(rb'&(?!amp;|lt;|gt;|quot;|apos;|#\d+;)')
-_BROKEN_QUOTE = re.compile(rb'=""([^"\s/<>][^"]*)""(?=[\s/>])')
+_BROKEN_QUOTE = re.compile(rb'=""([^"]+)""(?=[\s/>])')
+
 
 
 def _sanitize_tag(tag_bytes):
