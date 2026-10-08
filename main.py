@@ -1,4 +1,5 @@
 import os
+import gc
 import re
 import html
 import queue
@@ -88,6 +89,53 @@ QUIK_NUMERIC_FIELDS = {
     "PRICE", "QUANTITY", "ORDERVALUE", "VALUE", "VOLUME",
     "AccruedInterest",
 }
+
+
+# ============================================================
+# 0.0. ИЗМЕРЕНИЕ ПАМЯТИ
+# ============================================================
+
+def rss_mb():
+    """Возвращает текущий рабочий set процесса в МБ.
+
+    Windows — через psapi.GetProcessMemoryInfo.
+    Linux — ru_maxrss в KB, macOS — в байтах.
+    При любой ошибке возвращает -1.0.
+    """
+    try:
+        import sys as _sys
+        if _sys.platform.startswith("win"):
+            import ctypes
+            from ctypes import wintypes
+
+            class _PMC(ctypes.Structure):
+                _fields_ = [
+                    ("cb", wintypes.DWORD),
+                    ("PageFaultCount", wintypes.DWORD),
+                    ("PeakWorkingSetSize", ctypes.c_size_t),
+                    ("WorkingSetSize", ctypes.c_size_t),
+                    ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                    ("PagefileUsage", ctypes.c_size_t),
+                    ("PeakPagefileUsage", ctypes.c_size_t),
+                ]
+
+            pmc = _PMC()
+            pmc.cb = ctypes.sizeof(pmc)
+            ctypes.windll.psapi.GetProcessMemoryInfo(
+                ctypes.windll.kernel32.GetCurrentProcess(),
+                ctypes.byref(pmc), pmc.cb)
+            return pmc.WorkingSetSize / (1024.0 * 1024.0)
+
+        import resource
+        rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        if _sys.platform == "darwin":
+            return rss / (1024.0 * 1024.0)
+        return rss / 1024.0
+    except Exception:
+        return -1.0
 
 
 # ============================================================
@@ -597,28 +645,32 @@ def count_records_lxml(path, namespace=None, cancel_flag=None,
     n = 0
     CHUNK = 4 * 1024 * 1024
 
-    with open(path, "rb") as f:
-        while True:
-            if cancel_flag and cancel_flag.is_set():
-                break
-            chunk = f.read(CHUNK)
-            if not chunk:
-                break
-            try:
-                parser.feed(chunk)
-            except Exception:
-                pass
-            for _ in parser.read_events():
-                n += 1
-                if progress_cb and n % 50000 == 0:
-                    progress_cb(n)
-            if cancel_flag and cancel_flag.is_set():
-                break
-
     try:
-        parser.close()
-    except Exception:
-        pass
+        with open(path, "rb") as f:
+            while True:
+                if cancel_flag and cancel_flag.is_set():
+                    break
+                chunk = f.read(CHUNK)
+                if not chunk:
+                    break
+                try:
+                    parser.feed(chunk)
+                except Exception:
+                    pass
+                for _ in parser.read_events():
+                    n += 1
+                    if progress_cb and n % 50000 == 0:
+                        progress_cb(n)
+                if cancel_flag and cancel_flag.is_set():
+                    break
+
+        try:
+            parser.close()
+        except Exception:
+            pass
+    finally:
+        # явно отпускаем ссылку на парсер — не ждём GC
+        parser = None
 
     return n
 
@@ -919,106 +971,112 @@ def extract_records(path, record_tag=RECORD_TAG, namespace=None,
     count = 0
     CHUNK = 4 * 1024 * 1024
 
-    with open(path, "rb") as f:
-        while True:
-            if cancel_flag and cancel_flag.is_set():
-                return
-
-            data = f.read(CHUNK)
-            if not data:
-                break
-
-            try:
-                parser.feed(data)
-            except Exception:
-                pass
-
-            for _, elem in parser.read_events():
+    try:
+        with open(path, "rb") as f:
+            while True:
                 if cancel_flag and cancel_flag.is_set():
                     return
 
-                rec = {}
+                data = f.read(CHUNK)
+                if not data:
+                    break
 
-                for k, v in elem.attrib.items():
-                    rec[f"@{strip_ns(k)}"] = v
+                try:
+                    parser.feed(data)
+                except Exception:
+                    pass
 
-                for child in elem:
-                    if not isinstance(child.tag, str):
-                        continue
-                    tag_local = strip_ns(child.tag)
+                for _, elem in parser.read_events():
+                    if cancel_flag and cancel_flag.is_set():
+                        return
 
-                    if tag_local == config.container_tag:
-                        fields = list(child.findall(config.field_tag))
-                        if namespace and not fields:
-                            fields = list(child.findall(
-                                f"{{{namespace}}}{config.field_tag}"))
+                    rec = {}
 
-                        def _num_key(fe):
-                            try:
-                                return int(fe.get("Number") or 0)
-                            except ValueError:
-                                return 0
-                        fields.sort(key=_num_key)
+                    for k, v in elem.attrib.items():
+                        rec[f"@{strip_ns(k)}"] = v
 
-                        for field in fields:
-                            name = (field.get(config.name_attr) or "").strip()
-                            desc = (field.get(config.description_attr) or "").strip()
-                            prepared = (field.get(config.prepared_attr) or "").strip()
+                    for child in elem:
+                        if not isinstance(child.tag, str):
+                            continue
+                        tag_local = strip_ns(child.tag)
 
-                            if not name:
-                                continue
+                        if tag_local == config.container_tag:
+                            fields = list(child.findall(config.field_tag))
+                            if namespace and not fields:
+                                fields = list(child.findall(
+                                    f"{{{namespace}}}{config.field_tag}"))
 
-                            if desc and name not in descriptions:
-                                descriptions[name] = desc
+                            def _num_key(fe):
+                                try:
+                                    return int(fe.get("Number") or 0)
+                                except ValueError:
+                                    return 0
+                            fields.sort(key=_num_key)
 
-                            display = prepared
+                            for field in fields:
+                                name = (field.get(config.name_attr) or "").strip()
+                                desc = (field.get(config.description_attr) or "").strip()
+                                prepared = (field.get(config.prepared_attr) or "").strip()
 
-                            if name in rec:
+                                if not name:
+                                    continue
+
+                                if desc and name not in descriptions:
+                                    descriptions[name] = desc
+
+                                display = prepared
+
+                                if name in rec:
+                                    i = 2
+                                    while f"{name}_{i}" in rec:
+                                        i += 1
+                                    rec[f"{name}_{i}"] = display
+                                else:
+                                    rec[name] = display
+                            continue
+
+                        text = (child.text or "").strip()
+                        if text:
+                            key = tag_local
+                            if key in rec:
                                 i = 2
-                                while f"{name}_{i}" in rec:
+                                while f"{key}_{i}" in rec:
                                     i += 1
-                                rec[f"{name}_{i}"] = display
+                                rec[f"{key}_{i}"] = text
                             else:
-                                rec[name] = display
-                        continue
+                                rec[key] = text
 
-                    text = (child.text or "").strip()
-                    if text:
-                        key = tag_local
-                        if key in rec:
-                            i = 2
-                            while f"{key}_{i}" in rec:
-                                i += 1
-                            rec[f"{key}_{i}"] = text
-                        else:
-                            rec[key] = text
+                        for ak, av in child.attrib.items():
+                            key = f"{tag_local}.@{strip_ns(ak)}"
+                            if key in rec:
+                                i = 2
+                                while f"{key}_{i}" in rec:
+                                    i += 1
+                                rec[f"{key}_{i}"] = av
+                            else:
+                                rec[key] = av
 
-                    for ak, av in child.attrib.items():
-                        key = f"{tag_local}.@{strip_ns(ak)}"
-                        if key in rec:
-                            i = 2
-                            while f"{key}_{i}" in rec:
-                                i += 1
-                            rec[f"{key}_{i}"] = av
-                        else:
-                            rec[key] = av
+                    yield rec
 
-                yield rec
+                    elem.clear()
+                    while elem.getprevious() is not None:
+                        del elem.getparent()[0]
 
-                elem.clear()
-                while elem.getprevious() is not None:
-                    del elem.getparent()[0]
-
-                count += 1
-                if progress_cb and count % 1000 == 0:
-                    progress_cb(count)
-                if max_records and count >= max_records:
-                    return
+                    count += 1
+                    if progress_cb and count % 1000 == 0:
+                        progress_cb(count)
+                    if max_records and count >= max_records:
+                        return
 
         try:
             parser.close()
         except Exception:
             pass
+    finally:
+        # Явно отпускаем ссылку на парсер. Если генератор "висит"
+        # (не вызван .close() и не исчерпан), парсер жил бы до
+        # следующей сборки мусора и держал lxml-дерево.
+        parser = None
 
 
 # ============================================================
@@ -1713,6 +1771,7 @@ class App(tk.Tk):
                 logger.log(f"  work_dir: {work_dir}")
                 logger.log(f"  keep_temp_files: {keep_temp}")
                 logger.log(f"  save_bad_files: {save_bad}")
+                logger.log(f"  RSS на старте: {rss_mb():.0f} МБ")
                 logger.log("=" * 60)
 
                 clean_path = os.path.join(work_dir, "clean.xml")
@@ -1727,6 +1786,7 @@ class App(tk.Tk):
                     progress_cb=self._clean_progress_cb,
                     cancel_flag=self.cancel_flag,
                     logger=logger)
+                logger.log(f"  RSS после очистки: {rss_mb():.0f} МБ")
 
                 if self.cancel_flag.is_set():
                     raise RuntimeError("Отменено")
@@ -1741,6 +1801,7 @@ class App(tk.Tk):
                     progress_cb=self._split_progress_cb,
                     cancel_flag=self.cancel_flag,
                     logger=logger)
+                logger.log(f"  RSS после резки: {rss_mb():.0f} МБ")
 
                 if self.cancel_flag.is_set():
                     raise RuntimeError("Отменено")
@@ -1846,6 +1907,13 @@ class App(tk.Tk):
                 card_columns, card_header_map = build_columns_from_seen(
                     sample_seen, sample_desc)
 
+                # sample_seen больше не нужен — освобождаем явно.
+                # sample_desc ОСТАВЛЯЕМ: он идёт дальше в extract_records
+                # как кэш описаний полей.
+                del sample_seen
+                gc.collect()
+                logger.log(f"  RSS после сэмпла колонок: {rss_mb():.0f} МБ")
+
                 # ─── ЭТАП 3: генерация отчётов ───
                 logger.log("ЭТАП 3: генерация отчётов")
                 out_dir_base = os.path.dirname(os.path.abspath(out_path))
@@ -1936,7 +2004,27 @@ class App(tk.Tk):
                             self._show_error("Ошибка XML", m)
                         self.after(0, show_err)
                         written.append((file_path, -1))
-                        continue
+
+                    finally:
+                        # ─── Явное освобождение памяти после месяца ───
+                        # 1) .close() бросает GeneratorExit в текущую
+                        #    точку yield внутри extract_records, срабатывают
+                        #    все finally внутри — закрывается lxml-парсер,
+                        #    файл, последний <Trans>.
+                        try:
+                            records_iter.close()
+                        except Exception:
+                            pass
+                        del records_iter
+
+                        # 2) GC собирает циклы lxml/reportlab.
+                        #    Без этого RSS может не падать минутами.
+                        gc.collect()
+
+                        rss = rss_mb()
+                        logger.log(
+                            f"  [{i}/{K}] RSS после {month_label}: "
+                            f"{rss:.0f} МБ")
 
                 total_in_reports = sum(c for _, c in written if c >= 0)
 
@@ -1971,6 +2059,7 @@ class App(tk.Tk):
                 logger.log(f"total_in_xml (lxml): {total_in_xml}")
                 logger.log(f"total_in_reports: {total_in_reports}")
                 logger.log(f"total_time: {fmt_duration(total_time)}")
+                logger.log(f"RSS на финише: {rss_mb():.0f} МБ")
 
                 if not written:
                     raise RuntimeError("Отчёты не сформированы (отменено)")
