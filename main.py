@@ -184,7 +184,6 @@ _INVALID_BYTE_RE = re.compile(
 # 0x94 ”  -> "
 # 0x96 –  -> -
 # 0x97 —  -> -
-# Регулярка одним махом находит любой из этих байтов.
 _SMART_CHARS_MAP = {
     0x91: b"'",
     0x92: b"'",
@@ -199,16 +198,11 @@ _SMART_CHARS_RE = re.compile(
 
 
 def _smart_replace(match):
-    """Функция замены для re.sub: получает байт, возвращает пару байтов."""
     b = match.group(0)[0]
     return _SMART_CHARS_MAP.get(b, b' ')
 
 
 def _fix_smart_quotes(data: bytes) -> bytes:
-    """
-    Заменяет cp1251 «умные» кавычки и тире на ASCII-эквиваленты.
-    Работает по байтам, не декодируя — быстро и безопасно.
-    """
     if not data:
         return data
     if _SMART_CHARS_RE.search(data) is None:
@@ -244,7 +238,6 @@ def _process_clean_data(raw, final):
     while pos < n:
         lt = raw.find(b'<', pos)
         if lt == -1:
-            # текст до конца чанка — тоже обрабатываем
             tail = raw[pos:]
             tail = _fix_smart_quotes(tail)
             if _INVALID_BYTE_RE.search(tail):
@@ -285,7 +278,6 @@ def _process_clean_data(raw, final):
 
         tag = raw[lt:gt + 1]
 
-        # Быстрая проверка: есть ли что чистить
         if (b'&' in tag
                 or b'=""' in tag
                 or _INVALID_BYTE_RE.search(tag)
@@ -784,7 +776,21 @@ def extract_records(path, record_tag=RECORD_TAG, namespace=None,
     search_tag = qname(record_tag, namespace)
 
     with open(path, "rb") as f:
-        context = ET.iterparse(f, events=("end",), tag=search_tag)
+        # huge_tree=True обязателен для больших QUIK-отчётов.
+        # Без него libxml2 падает с "internal error: Huge input lookup",
+        # когда размер накопленного дерева превышает встроенные лимиты.
+        parser = ET.XMLParser(
+            huge_tree=True,
+            recover=True,
+            resolve_entities=False,
+            no_network=True,
+        )
+        context = ET.iterparse(
+            f,
+            events=("end",),
+            tag=search_tag,
+            parser=parser,
+        )
 
         count = 0
         for _, elem in context:
@@ -1335,8 +1341,8 @@ class App(tk.Tk):
         self.view_mode = tk.StringVar(value="cards")
 
         # Чекбоксы
-        self.delete_temp_files = tk.BooleanVar(value=True)   # по умолчанию удалять
-        self.save_bad_files = tk.BooleanVar(value=True)      # по умолчанию сохранять битые
+        self.delete_temp_files = tk.BooleanVar(value=True)
+        self.save_bad_files = tk.BooleanVar(value=True)
 
         self.cancel_flag = threading.Event()
         self._start_time = None
@@ -1370,7 +1376,6 @@ class App(tk.Tk):
                             variable=self.format_var).pack(
                 side="left", padx=16, pady=8)
 
-        # ─── Чекбоксы настроек ───
         frame_opts = ttk.LabelFrame(self, text="4. Опции обработки")
         frame_opts.pack(fill="x", **pad)
 
@@ -1387,7 +1392,6 @@ class App(tk.Tk):
             variable=self.save_bad_files,
         ).pack(anchor="w", padx=10, pady=4)
 
-        # ─── Блок времени и целостности ───
         frame_time = ttk.LabelFrame(self, text="5. Время и целостность")
         frame_time.pack(fill="x", **pad)
 
@@ -1514,7 +1518,6 @@ class App(tk.Tk):
         as_cards = self.view_mode.get() == "cards"
         config = ExtractConfig()
 
-        # Читаем настройки из UI — на момент запуска
         keep_temp = not self.delete_temp_files.get()
         save_bad = self.save_bad_files.get()
 
@@ -1610,7 +1613,6 @@ class App(tk.Tk):
                     text=f"{total_in_xml:,}".replace(",", " "),
                     foreground="black"))
 
-                # Удаляем очищенный файл, если не просили сохранять
                 if not keep_temp:
                     try:
                         os.remove(clean_path)
@@ -1709,7 +1711,6 @@ class App(tk.Tk):
                         diag = diagnose_xml_error(month_path, xml_exc,
                                                   logger)
 
-                        # Сохраняем битый файл только если опция включена
                         if save_bad:
                             saved_path = os.path.join(
                                 reports_dir,
