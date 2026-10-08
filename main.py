@@ -168,8 +168,6 @@ def extract_month_key(rec):
 
 _AMP_FIX = re.compile(rb'&(?!amp;|lt;|gt;|quot;|apos;|#\d+;)')
 _BROKEN_QUOTE = re.compile(rb'=""([^"]+)""(?=[\s/>])')
-
-# Каскад кавычек перед концом тега: ClientCode="N=""> -> ClientCode="N=">
 _MULTI_QUOTES = re.compile(rb'"+(?=[\s/>])')
 
 _INVALID_XML_BYTES = bytes(
@@ -181,14 +179,15 @@ _INVALID_BYTE_RE = re.compile(
 )
 
 # ─── Умные кавычки/тире cp1251 -> ASCII-эквиваленты ───
-# 0x91 ‘  0x92 ’  0x93 “  0x94 ”  0x96 –  0x97 —
+# Заменяем, чтобы получились корректные кавычки/дефисы,
+# а не удаляем.
 _SMART_CHARS_MAP = {
-    0x91: b"'",
-    0x92: b"'",
-    0x93: b'"',
-    0x94: b'"',
-    0x96: b'-',
-    0x97: b'-',
+    0x91: b"'",   # ‘
+    0x92: b"'",   # ’
+    0x93: b'"',   # “
+    0x94: b'"',   # ”
+    0x96: b'-',   # –
+    0x97: b'-',   # —
 }
 _SMART_CHARS_RE = re.compile(
     b'[' + bytes(_SMART_CHARS_MAP.keys()) + b']'
@@ -225,8 +224,7 @@ def _sanitize_tag(tag_bytes):
         tag_bytes = _BROKEN_QUOTE.sub(
             rb'="&quot;\1&quot;"', tag_bytes)
 
-    # 4) каскад кавычек перед концом тега:
-    #    ClientCode="N=""> -> ClientCode="N=">
+    # 4) каскад кавычек перед концом тега -> одна
     if b'""' in tag_bytes:
         tag_bytes = _MULTI_QUOTES.sub(b'"', tag_bytes)
 
