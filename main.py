@@ -169,6 +169,9 @@ def extract_month_key(rec):
 _AMP_FIX = re.compile(rb'&(?!amp;|lt;|gt;|quot;|apos;|#\d+;)')
 _BROKEN_QUOTE = re.compile(rb'=""([^"]+)""(?=[\s/>])')
 
+# Каскад кавычек перед концом тега: ClientCode="N=""> -> ClientCode="N=">
+_MULTI_QUOTES = re.compile(rb'"+(?=[\s/>])')
+
 _INVALID_XML_BYTES = bytes(
     b for b in range(0x20)
     if b not in (0x09, 0x0A, 0x0D)
@@ -178,10 +181,6 @@ _INVALID_BYTE_RE = re.compile(
 )
 
 # ─── Умные кавычки и тире cp1251 — ПРОСТО УДАЛЯЕМ ───
-# 0x91 ‘  0x92 ’  0x93 “  0x94 ”  0x96 –  0x97 —
-# Эти символы ломают границы атрибутов в QUIK-отчётах
-# (парсер видит внутри значения обычную кавычку, хотя
-# это другой байт), поэтому безопаснее от них избавиться.
 _SMART_CHARS_MAP = {
     0x91: b"",
     0x92: b"",
@@ -224,6 +223,11 @@ def _sanitize_tag(tag_bytes):
     if b'=""' in tag_bytes:
         tag_bytes = _BROKEN_QUOTE.sub(
             rb'="&quot;\1&quot;"', tag_bytes)
+
+    # 4) каскад кавычек перед концом тега:
+    #    ClientCode="N=""> -> ClientCode="N=">
+    if b'""' in tag_bytes:
+        tag_bytes = _MULTI_QUOTES.sub(b'"', tag_bytes)
 
     return tag_bytes
 
@@ -278,6 +282,7 @@ def _process_clean_data(raw, final):
 
         if (b'&' in tag
                 or b'=""' in tag
+                or b'""' in tag
                 or _INVALID_BYTE_RE.search(tag)
                 or _SMART_CHARS_RE.search(tag)):
             tag = _sanitize_tag(tag)
