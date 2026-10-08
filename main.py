@@ -177,14 +177,58 @@ _INVALID_BYTE_RE = re.compile(
     rb'[' + re.escape(_INVALID_XML_BYTES) + rb']'
 )
 
+# ─── Умные кавычки и тире cp1251 ───
+# 0x91 ‘  -> '
+# 0x92 ’  -> '
+# 0x93 “  -> "
+# 0x94 ”  -> "
+# 0x96 –  -> -
+# 0x97 —  -> -
+# Регулярка одним махом находит любой из этих байтов.
+_SMART_CHARS_MAP = {
+    0x91: b"'",
+    0x92: b"'",
+    0x93: b'"',
+    0x94: b'"',
+    0x96: b'-',
+    0x97: b'-',
+}
+_SMART_CHARS_RE = re.compile(
+    b'[' + bytes(_SMART_CHARS_MAP.keys()) + b']'
+)
+
+
+def _smart_replace(match):
+    """Функция замены для re.sub: получает байт, возвращает пару байтов."""
+    b = match.group(0)[0]
+    return _SMART_CHARS_MAP.get(b, b' ')
+
+
+def _fix_smart_quotes(data: bytes) -> bytes:
+    """
+    Заменяет cp1251 «умные» кавычки и тире на ASCII-эквиваленты.
+    Работает по байтам, не декодируя — быстро и безопасно.
+    """
+    if not data:
+        return data
+    if _SMART_CHARS_RE.search(data) is None:
+        return data
+    return _SMART_CHARS_RE.sub(_smart_replace, data)
+
 
 def _sanitize_tag(tag_bytes):
+    # 0) умные кавычки/тире -> ASCII
+    tag_bytes = _fix_smart_quotes(tag_bytes)
+
+    # 1) невалидные управляющие байты
     if _INVALID_BYTE_RE.search(tag_bytes):
         tag_bytes = _INVALID_BYTE_RE.sub(b'', tag_bytes)
 
+    # 2) & -> &amp;
     if b'&' in tag_bytes:
         tag_bytes = _AMP_FIX.sub(b'&amp;', tag_bytes)
 
+    # 3) =""X"" -> ="&quot;X&quot;"
     if b'=""' in tag_bytes:
         tag_bytes = _BROKEN_QUOTE.sub(
             rb'="&quot;\1&quot;"', tag_bytes)
@@ -200,13 +244,16 @@ def _process_clean_data(raw, final):
     while pos < n:
         lt = raw.find(b'<', pos)
         if lt == -1:
+            # текст до конца чанка — тоже обрабатываем
             tail = raw[pos:]
+            tail = _fix_smart_quotes(tail)
             if _INVALID_BYTE_RE.search(tail):
                 tail = _INVALID_BYTE_RE.sub(b'', tail)
             out.extend(tail)
             return bytes(out), b""
 
         text_chunk = raw[pos:lt]
+        text_chunk = _fix_smart_quotes(text_chunk)
         if _INVALID_BYTE_RE.search(text_chunk):
             text_chunk = _INVALID_BYTE_RE.sub(b'', text_chunk)
         out.extend(text_chunk)
@@ -238,8 +285,11 @@ def _process_clean_data(raw, final):
 
         tag = raw[lt:gt + 1]
 
-        if (b'&' in tag or b'=""' in tag
-                or _INVALID_BYTE_RE.search(tag)):
+        # Быстрая проверка: есть ли что чистить
+        if (b'&' in tag
+                or b'=""' in tag
+                or _INVALID_BYTE_RE.search(tag)
+                or _SMART_CHARS_RE.search(tag)):
             tag = _sanitize_tag(tag)
 
         out.extend(tag)
